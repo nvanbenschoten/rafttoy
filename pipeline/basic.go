@@ -65,6 +65,7 @@ func (b *basic) applyToStore(ents []raftpb.Entry) {
 			if len(e.Data) == 0 {
 				continue
 			}
+			b.s.ApplyEntry(e)
 			ec := proposal.EncProposal(e.Data)
 			b.pt.Finish(ec.GetID())
 		case raftpb.EntryConfChange:
