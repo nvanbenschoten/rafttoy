@@ -11,18 +11,18 @@ import (
 )
 
 type basic struct {
-	n *raft.RawNode
-	w wal.Wal
-	s storage.Storage
-	a *proposal.Tracker
+	n  *raft.RawNode
+	w  wal.Wal
+	s  storage.Storage
+	pt *proposal.Tracker
 }
 
-func NewBasic(n *raft.RawNode, w wal.Wal, s storage.Storage, a *proposal.Tracker) Pipeline {
+func NewBasic(n *raft.RawNode, w wal.Wal, s storage.Storage, pt *proposal.Tracker) Pipeline {
 	return &basic{
-		n: n,
-		w: w,
-		s: s,
-		a: a,
+		n:  n,
+		w:  w,
+		s:  s,
+		pt: pt,
 	}
 }
 
@@ -66,7 +66,7 @@ func (b *basic) applyToStore(ents []raftpb.Entry) {
 				continue
 			}
 			ec := proposal.EncProposal(e.Data)
-			b.a.Finish(ec.GetID())
+			b.pt.Finish(ec.GetID())
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
 			cc.Unmarshal(e.Data)

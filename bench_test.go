@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/util"
 )
 
@@ -26,8 +27,11 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 	defer p.stop()
 
 	// Wait for the initial leader election to complete.
-	data := make([]byte, bytes)
-	for !p.propose(data) {
+	prop := proposal.Proposal{
+		Key: []byte("key"),
+		Val: make([]byte, bytes),
+	}
+	for !p.propose(prop) {
 	}
 
 	b.ResetTimer()
@@ -39,7 +43,7 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < b.N; j++ {
-				if !p.propose(data) {
+				if !p.propose(prop) {
 					b.Fatal("proposal failed")
 				}
 			}

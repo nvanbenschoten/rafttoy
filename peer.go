@@ -95,9 +95,9 @@ func (p *peer) stopped() bool {
 	return atomic.LoadInt32(&p.done) == 1
 }
 
-func (p *peer) propose(b []byte) bool {
+func (p *peer) propose(prop proposal.Proposal) bool {
 	c := make(chan struct{})
-	enc := proposal.Encode(b)
+	enc := proposal.Encode(prop)
 
 	p.mu.Lock()
 	if p.stopped() {
@@ -123,14 +123,17 @@ func main() {
 	p := newPeer()
 	go p.run()
 
-	data := []byte("data")
+	prop := proposal.Proposal{
+		Key: []byte("key"),
+		Val: []byte("val"),
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for !p.stopped() {
-				if p.propose(data) {
+				if p.propose(prop) {
 					log.Print("successful proposal")
 				} else {
 					log.Print("unsuccessful proposal")
