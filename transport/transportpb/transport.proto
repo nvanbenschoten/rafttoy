@@ -1,0 +1,8 @@
+syntax = "proto3";
+package transportpb;
+
+import "go.etcd.io/etcd/raft/raftpb/raft.proto";
+
+service RaftService {
+    rpc RaftMessage(stream raftpb.Message) returns (stream raftpb.Message) {}
+}

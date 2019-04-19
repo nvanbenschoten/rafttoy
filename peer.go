@@ -9,8 +9,9 @@ import (
 	"github.com/nvanbenschoten/raft-toy/pipeline"
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
+	"github.com/nvanbenschoten/raft-toy/storage/engine"
+	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/util"
-	"github.com/nvanbenschoten/raft-toy/wal"
 	"go.etcd.io/etcd/raft"
 )
 
@@ -28,8 +29,9 @@ type peer struct {
 
 func newPeer() *peer {
 	w := wal.NewMem()
-	s := storage.NewMem()
-	rs := util.NewRaftStorage(w, s)
+	e := engine.NewMem()
+	s := storage.CombineWalAndEngine(w, e)
+	rs := util.NewRaftStorage(s)
 
 	c := &raft.Config{
 		ID:              0x01,
@@ -48,7 +50,7 @@ func newPeer() *peer {
 	p := new(peer)
 	p.sig.L = &p.mu
 	p.n = n
-	p.pl = pipeline.NewBasic(n, w, s, nil, &p.pt)
+	p.pl = pipeline.NewBasic(n, s, nil, &p.pt)
 	p.pt = proposal.MakeTracker()
 	return p
 }

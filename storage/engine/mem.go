@@ -1,4 +1,4 @@
-package storage
+package engine
 
 import (
 	"log"
@@ -14,7 +14,7 @@ type mem struct {
 }
 
 // NewMem creates a new in-memory storage engine.
-func NewMem() Storage {
+func NewMem() Engine {
 	return &mem{
 		m:  raft.NewMemoryStorage(),
 		kv: make(map[string][]byte),
