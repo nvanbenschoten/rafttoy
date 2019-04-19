@@ -39,7 +39,7 @@ func newPeer() *peer {
 		MaxSizePerMsg:   4096,
 		MaxInflightMsgs: 256,
 	}
-	peers := []raft.Peer{{ID: 0x01}}
+	peers := []raft.Peer{{ID: 0x01}, {ID: 0x02}, {ID: 0x03}}
 	n, err := raft.NewRawNode(c, peers)
 	if err != nil {
 		log.Fatal(err)
@@ -48,7 +48,7 @@ func newPeer() *peer {
 	p := new(peer)
 	p.sig.L = &p.mu
 	p.n = n
-	p.pl = pipeline.NewBasic(n, w, s, &p.pt)
+	p.pl = pipeline.NewBasic(n, w, s, nil, &p.pt)
 	p.pt = proposal.MakeTracker()
 	return p
 }

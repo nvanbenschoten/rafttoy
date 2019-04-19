@@ -5,6 +5,7 @@ import (
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
+	"github.com/nvanbenschoten/raft-toy/transport"
 	"github.com/nvanbenschoten/raft-toy/wal"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -14,14 +15,18 @@ type basic struct {
 	n  *raft.RawNode
 	w  wal.Wal
 	s  storage.Storage
+	t  transport.Transport
 	pt *proposal.Tracker
 }
 
-func NewBasic(n *raft.RawNode, w wal.Wal, s storage.Storage, pt *proposal.Tracker) Pipeline {
+func NewBasic(
+	n *raft.RawNode, w wal.Wal, s storage.Storage, t transport.Transport, pt *proposal.Tracker,
+) Pipeline {
 	return &basic{
 		n:  n,
 		w:  w,
 		s:  s,
+		t:  t,
 		pt: pt,
 	}
 }
@@ -40,7 +45,7 @@ func (b *basic) RunOnce() {
 
 func (b *basic) sendMessages(msgs []raftpb.Message) {
 	if len(msgs) > 0 {
-		log.Fatalf("unhandled messages %v", msgs)
+		b.t.Send(msgs)
 	}
 }
 
