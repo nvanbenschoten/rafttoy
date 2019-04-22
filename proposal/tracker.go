@@ -11,6 +11,10 @@ func MakeTracker() Tracker {
 	}
 }
 
+func (pr *Tracker) Len() int {
+	return len(pr.m)
+}
+
 func (pr *Tracker) Register(enc EncProposal, c chan bool) {
 	pr.m[enc.GetID()] = c
 }

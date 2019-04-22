@@ -31,3 +31,8 @@ func (m *mem) ApplyEntry(ent raftpb.Entry) {
 	prop := proposal.Decode(ent.Data)
 	m.kv[string(prop.Key)] = prop.Val
 }
+
+func (m *mem) Clear() {
+	m.m = raft.NewMemoryStorage()
+	m.kv = make(map[string][]byte)
+}

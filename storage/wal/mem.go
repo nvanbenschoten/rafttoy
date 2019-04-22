@@ -55,3 +55,7 @@ func (m *mem) FirstIndex() uint64 {
 	}
 	return i
 }
+
+func (m *mem) Truncate() {
+	m.m = raft.NewMemoryStorage()
+}

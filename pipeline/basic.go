@@ -12,10 +12,11 @@ import (
 )
 
 type basic struct {
-	n  *raft.RawNode
-	s  storage.Storage
-	t  transport.Transport
-	pt *proposal.Tracker
+	epoch int32
+	n     *raft.RawNode
+	s     storage.Storage
+	t     transport.Transport
+	pt    *proposal.Tracker
 }
 
 // NewBasic creates a new "basic" pipeline.
@@ -24,8 +25,9 @@ func NewBasic() Pipeline {
 }
 
 func (b *basic) Init(
-	n *raft.RawNode, s storage.Storage, t transport.Transport, pt *proposal.Tracker,
+	epoch int32, n *raft.RawNode, s storage.Storage, t transport.Transport, pt *proposal.Tracker,
 ) {
+	b.epoch = epoch
 	b.n = n
 	b.s = s
 	b.t = t
@@ -48,7 +50,7 @@ func (b *basic) RunOnce(l sync.Locker) {
 
 func (b *basic) sendMessages(msgs []raftpb.Message) {
 	if len(msgs) > 0 {
-		b.t.Send(msgs)
+		b.t.Send(b.epoch, msgs)
 	}
 }
 

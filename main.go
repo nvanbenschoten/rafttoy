@@ -12,19 +12,10 @@ import (
 	"github.com/nvanbenschoten/raft-toy/storage/engine"
 	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/transport"
-	"go.etcd.io/etcd/raft"
 )
 
-func newPeer() *peer.Peer {
-	// Raft config.
-	cfg := &raft.Config{
-		ID:              0x01,
-		ElectionTick:    3,
-		HeartbeatTick:   1,
-		MaxSizePerMsg:   4096,
-		MaxInflightMsgs: 256,
-	}
-	peers := []raft.Peer{{ID: 0x01}}
+func newPeer(epoch int32) *peer.Peer {
+	cfg := parseFlags()
 
 	// Storage.
 	w := wal.NewMem()
@@ -32,18 +23,26 @@ func newPeer() *peer.Peer {
 	s := storage.CombineWalAndEngine(w, e)
 
 	// Transport.
-	var t transport.Transport
+	t := transport.NewGRPC()
 
 	// Pipeline.
 	pl := pipeline.NewBasic()
 
-	return peer.New(cfg, peers, s, t, pl)
+	return peer.New(epoch, cfg, s, t, pl)
 }
 
 func main() {
-	p := newPeer()
+	p := newPeer(0)
+	if !runLoad {
+		p.Run()
+		return
+	}
+
 	go p.Run()
 	defer p.Stop()
+
+	// Wait for the initial leader election to complete.
+	becomeLeader(p)
 
 	prop := proposal.Proposal{
 		Key: []byte("key"),
@@ -64,5 +63,20 @@ func main() {
 				time.Sleep(1 * time.Second)
 			}
 		}()
+	}
+}
+
+func becomeLeader(p *peer.Peer) {
+	prop := proposal.Proposal{
+		Key: []byte("key"),
+		Val: make([]byte, 1),
+	}
+	var lastCamp time.Time
+	for !p.Propose(prop) {
+		if now := time.Now(); now.Sub(lastCamp) > 250*time.Millisecond {
+			p.Campaign()
+			lastCamp = now
+		}
+		time.Sleep(1 * time.Millisecond)
 	}
 }

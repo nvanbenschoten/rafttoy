@@ -6,12 +6,18 @@ import (
 	"testing"
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/util"
 	"golang.org/x/sync/errgroup"
 )
 
-func init() {
-	util.DisableRaftLogging()
+// epoch represents a single iteration of a `go bench` loop. Tracking it and
+// threading it through Raft messages allows a single instance of `go bench`
+// to coordinate Raft state machine resets across a cluster of Go processes.
+var epoch int32
+
+func newEpoch() int32 {
+	e := epoch
+	epoch++
+	return e
 }
 
 func BenchmarkRaft(b *testing.B) {
@@ -23,16 +29,17 @@ func BenchmarkRaft(b *testing.B) {
 }
 
 func benchmarkRaft(b *testing.B, conc, bytes int) {
-	p := newPeer()
+	p := newPeer(newEpoch())
 	go p.Run()
 	defer p.Stop()
 
 	// Wait for the initial leader election to complete.
+	becomeLeader(p)
+
+	// Create a single instance of a Raft proposal.
 	prop := proposal.Proposal{
 		Key: []byte("key"),
 		Val: make([]byte, bytes),
-	}
-	for !p.Propose(prop) {
 	}
 
 	b.ResetTimer()

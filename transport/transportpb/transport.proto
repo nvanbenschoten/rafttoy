@@ -1,8 +1,14 @@
 syntax = "proto3";
 package transportpb;
 
+import "gogoproto/gogo.proto";
 import "go.etcd.io/etcd/raft/raftpb/raft.proto";
 
+message RaftMsg {
+    int32        epoch = 1;
+    raftpb.Message msg = 2;
+}
+
 service RaftService {
-    rpc RaftMessage(stream raftpb.Message) returns (stream raftpb.Message) {}
+    rpc RaftMessage(stream RaftMsg) returns (stream RaftMsg) {}
 }

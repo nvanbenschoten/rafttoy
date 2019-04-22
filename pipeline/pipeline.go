@@ -10,7 +10,7 @@ import (
 )
 
 type Pipeline interface {
-	Init(n *raft.RawNode, s storage.Storage, t transport.Transport, pt *proposal.Tracker)
+	Init(int32, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker)
 	Start()
 	Stop()
 	RunOnce(sync.Locker)
