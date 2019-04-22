@@ -41,8 +41,8 @@ func (b *basic) RunOnce(l sync.Locker) {
 	b.saveToDisk(rd.Entries, rd.HardState, rd.MustSync)
 	b.sendMessages(rd.Messages)
 	b.processSnapshot(rd.Snapshot)
-	l.Lock()
 	b.applyToStore(rd.CommittedEntries)
+	l.Lock()
 	b.n.Advance(rd)
 }
 

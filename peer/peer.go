@@ -15,9 +15,11 @@ import (
 )
 
 type Peer struct {
-	mu   sync.Mutex
-	sig  sync.Cond
-	done int32
+	mu     sync.RWMutex
+	sig    sync.Cond
+	sigAt  int32
+	revSig sync.Cond
+	done   int32
 
 	n  *raft.RawNode
 	s  storage.Storage
@@ -25,6 +27,7 @@ type Peer struct {
 	pl pipeline.Pipeline
 
 	pi int64
+	pb propBuf
 	pt proposal.Tracker
 }
 
@@ -51,6 +54,7 @@ func New(
 	}
 	p.pl.Init(n, s, t, &p.pt)
 	p.sig.L = &p.mu
+	p.revSig.L = p.mu.RLocker()
 	return p
 }
 
@@ -61,12 +65,13 @@ func (p *Peer) Run() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
-		for !p.n.HasReady() {
+		for p.pb.lenWLocked() == 0 && !p.n.HasReady() {
 			if p.stopped() {
 				return
 			}
 			p.sig.Wait()
 		}
+		p.flushPropsLocked()
 		p.pl.RunOnce(&p.mu)
 	}
 }
@@ -97,25 +102,35 @@ func (p *Peer) stopped() bool {
 }
 
 func (p *Peer) Propose(prop proposal.Proposal) bool {
-	c := make(chan struct{})
+	prop.ID = atomic.AddInt64(&p.pi, 1)
 	enc := proposal.Encode(prop)
+	c := make(chan bool, 1)
+	el := propBufElem{enc, c}
 
-	p.mu.Lock()
-	if p.stopped() {
-		p.mu.Unlock()
-		return false
+	p.mu.RLock()
+	for !p.pb.addRLocked(el) {
+		p.revSig.Wait()
 	}
-	p.pi++
-	enc.SetID(p.pi)
-	err := p.n.Propose(enc)
-	if err != nil {
-		p.mu.Unlock()
-		return false
-	}
-	p.pt.Register(enc, c)
-	p.mu.Unlock()
+	p.mu.RUnlock()
+
 	p.sig.Signal()
+	if p.stopped() {
+		return false
+	}
+	return <-c
+}
 
-	<-c
-	return true
+func (p *Peer) flushPropsLocked() {
+	b := p.pb.flushWLocked()
+	for _, e := range b {
+		err := p.n.Propose(e.enc)
+		if err != nil {
+			e.c <- false
+		} else {
+			p.pt.Register(e.enc, e.c)
+		}
+	}
+	if len(b) == propBufCap {
+		p.revSig.Broadcast()
+	}
 }

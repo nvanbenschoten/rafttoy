@@ -1,12 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"sync"
 	"testing"
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/util"
+	"golang.org/x/sync/errgroup"
 )
 
 func init() {
@@ -36,18 +37,20 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 
 	b.ResetTimer()
 	b.SetBytes(int64(conc * bytes))
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	var g errgroup.Group
+	defer g.Wait()
 	for i := 0; i < conc; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		g.Go(func() error {
 			for j := 0; j < b.N; j++ {
 				if !p.Propose(prop) {
-					b.Fatal("proposal failed")
+					return errors.New("proposal failed")
 				}
 			}
-		}()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		b.Fatal(err)
 	}
 }
 
