@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"log"
+	"sync"
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
@@ -17,25 +18,30 @@ type basic struct {
 	pt *proposal.Tracker
 }
 
-func NewBasic(
+// NewBasic creates a new "basic" pipeline.
+func NewBasic() Pipeline {
+	return new(basic)
+}
+
+func (b *basic) Init(
 	n *raft.RawNode, s storage.Storage, t transport.Transport, pt *proposal.Tracker,
-) Pipeline {
-	return &basic{
-		n:  n,
-		s:  s,
-		t:  t,
-		pt: pt,
-	}
+) {
+	b.n = n
+	b.s = s
+	b.t = t
+	b.pt = pt
 }
 
 func (b *basic) Start() {}
 func (b *basic) Stop()  {}
 
-func (b *basic) RunOnce() {
+func (b *basic) RunOnce(l sync.Locker) {
 	rd := b.n.Ready()
+	l.Unlock()
 	b.saveToDisk(rd.Entries, rd.HardState, rd.MustSync)
 	b.sendMessages(rd.Messages)
 	b.processSnapshot(rd.Snapshot)
+	l.Lock()
 	b.applyToStore(rd.CommittedEntries)
 	b.n.Advance(rd)
 }
