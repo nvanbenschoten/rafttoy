@@ -36,3 +36,7 @@ func (m *mem) Clear() {
 	m.m = raft.NewMemoryStorage()
 	m.kv = make(map[string][]byte)
 }
+
+func (m *mem) Close() {
+	// No-op.
+}

@@ -56,14 +56,15 @@ func (b *basic) sendMessages(msgs []raftpb.Message) {
 
 func (b *basic) saveToDisk(ents []raftpb.Entry, st raftpb.HardState, sync bool) {
 	if as, ok := b.s.(storage.AtomicStorage); ok {
-		as.AppendAndSetHardState(ents, st)
+		as.AppendAndSetHardState(ents, st, sync)
 	} else {
-		b.s.Append(ents)
+		if len(ents) > 0 {
+			b.s.Append(ents)
+		}
 		if !raft.IsEmptyHardState(st) {
 			b.s.SetHardState(st)
 		}
 	}
-	_ = sync
 }
 
 func (b *basic) processSnapshot(sn raftpb.Snapshot) {

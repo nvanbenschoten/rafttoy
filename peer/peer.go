@@ -119,20 +119,29 @@ func (p *Peer) Stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	atomic.StoreInt32(&p.done, 1)
-	p.t.Close()
 	p.pt.FinishAll()
-	p.pl.Stop()
 	p.sig.Signal()
+	p.Close()
 }
 
 func (p *Peer) stopped() bool {
 	return atomic.LoadInt32(&p.done) == 1
 }
 
+// Close releases resources held by Peer. It does not acquire
+// any locks, so it can be used during an unclean shutdown.
+func (p *Peer) Close() {
+	p.s.Close()
+	p.t.Close()
+	p.pl.Stop()
+}
+
+// Campaign causes the Peer to transition to the candidate state
+// and attempt to acquire Raft leadership.
 func (p *Peer) Campaign() {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.n.Campaign()
-	p.mu.Unlock()
 	p.sig.Signal()
 }
 

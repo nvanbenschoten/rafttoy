@@ -2,7 +2,11 @@ package main
 
 import (
 	"log"
+	"math/rand"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nvanbenschoten/raft-toy/peer"
@@ -10,17 +14,26 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/storage/engine"
-	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/transport"
 )
+
+func init() {
+	rand.Seed(time.Now().UTC().UnixNano())
+}
 
 func newPeer(epoch int32) *peer.Peer {
 	cfg := parseFlags()
 
 	// Storage.
-	w := wal.NewMem()
-	e := engine.NewMem()
-	s := storage.CombineWalAndEngine(w, e)
+	//  WAL.
+	// w := wal.NewMem()
+	// w := engine.NewPebble().(wal.Wal)
+	//  Engine.
+	// e := engine.NewMem()
+	// e := engine.NewPebble()
+	//  Combined.
+	// s := storage.CombineWalAndEngine(w, e)
+	s := engine.NewPebble().(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
@@ -33,6 +46,17 @@ func newPeer(epoch int32) *peer.Peer {
 
 func main() {
 	p := newPeer(0)
+
+	// Make sure we clean up before exiting.
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		p.Close()
+		os.Exit(0)
+	}()
+
+	// If we're not running load, we enter follower mode.
 	if !runLoad {
 		p.Run()
 		return

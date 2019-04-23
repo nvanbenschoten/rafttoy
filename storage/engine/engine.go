@@ -6,4 +6,5 @@ type Engine interface {
 	SetHardState(raftpb.HardState)
 	ApplyEntry(raftpb.Entry)
 	Clear()
+	Close()
 }

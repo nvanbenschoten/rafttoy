@@ -15,7 +15,7 @@ type Storage interface {
 // Raft log entries and the Raft HardState.
 type AtomicStorage interface {
 	Storage
-	AppendAndSetHardState([]raftpb.Entry, raftpb.HardState)
+	AppendAndSetHardState([]raftpb.Entry, raftpb.HardState, bool)
 }
 
 type splitStorage struct {

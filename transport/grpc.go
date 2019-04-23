@@ -19,6 +19,8 @@ type grpc struct {
 	handler RaftHandler
 
 	rpc        *rpc.Server
+	dialCtx    context.Context
+	dialCancel func()
 	clientMu   sync.Mutex
 	clientBufs map[uint64]chan *transpb.RaftMsg
 }
@@ -37,6 +39,7 @@ func (g *grpc) Init(addr string, peers map[uint64]string) {
 func (g *grpc) Serve(h RaftHandler) {
 	g.handler = h
 	g.rpc = rpc.NewServer()
+	g.dialCtx, g.dialCancel = context.WithCancel(context.Background())
 	transpb.RegisterRaftServiceServer(g.rpc, g)
 
 	var lis net.Listener
@@ -97,40 +100,58 @@ func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {
 	if !ok {
 		log.Fatalf("unknown peer %d", to)
 	}
-	conn, err := rpc.Dial(url, rpc.WithInsecure(), rpc.WithBlock())
+	conn, err := rpc.DialContext(g.dialCtx, url, rpc.WithInsecure(), rpc.WithBlock())
 	if err != nil {
-		log.Fatalf("error when dialing %d: %v", to, err)
+		switch err {
+		case context.Canceled:
+			return
+		default:
+			log.Fatalf("error when dialing %d: %v", to, err)
+		}
 	}
 	c := make(chan *transpb.RaftMsg, 1024)
-	go g.sender(to, conn, c)
 	g.clientBufs[to] = c
+	go g.sender(to, conn, c)
 }
 
 func (g *grpc) sender(to uint64, conn *rpc.ClientConn, c <-chan *transpb.RaftMsg) {
 	defer conn.Close()
+	defer func() {
+		g.clientMu.Lock()
+		defer g.clientMu.Unlock()
+		delete(g.clientBufs, to)
+	}()
+
 	client := transpb.NewRaftServiceClient(conn)
-	stream, err := client.RaftMessage(context.Background())
+	stream, err := client.RaftMessage(g.dialCtx)
 	if err != nil {
-		log.Fatal(err)
+		switch err {
+		case context.Canceled:
+			return
+		default:
+			log.Fatal(err)
+		}
 	}
 	for m := range c {
 		if err := stream.Send(m); err != nil {
-			if err == io.EOF {
-				g.clientMu.Lock()
-				delete(g.clientBufs, to)
-				g.clientMu.Unlock()
+			switch err {
+			case context.Canceled:
 				return
+			case io.EOF:
+				return
+			default:
+				log.Fatal(err)
 			}
-			log.Fatal(err)
 		}
 	}
 }
 
 func (g *grpc) Close() {
+	g.rpc.Stop()
+	g.dialCancel()
 	g.clientMu.Lock()
 	defer g.clientMu.Unlock()
 	for _, c := range g.clientBufs {
 		close(c)
 	}
-	g.rpc.Stop()
 }
