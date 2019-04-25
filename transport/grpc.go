@@ -97,7 +97,10 @@ func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {
 	buf, ok := g.clientBufs[to]
 	g.clientMu.Unlock()
 	if ok {
-		buf <- m
+		select {
+		case buf <- m:
+		case <-g.dialCtx.Done():
+		}
 		return
 	}
 
