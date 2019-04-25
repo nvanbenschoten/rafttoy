@@ -51,6 +51,7 @@ github.com/petermattis/pebble v0.0.0-20190417235451-2864e07afaac/go.mod h1:i/VB/
 github.com/petermattis/pebble v0.0.0-20190422212610-ff25ad3f1b5b h1:LOI/zwDJSuKP3YEAO8TsuQPF0GBJGGPL3tvC8pP6nio=
 github.com/petermattis/pebble v0.0.0-20190422212610-ff25ad3f1b5b/go.mod h1:i/VB/VrRmBmR6eJtu/SuAufuTNJeDkfi8RP+pTXov1s=
 github.com/pkg/errors v0.8.0/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/pkg/errors v0.8.1 h1:iURUrRGxPUNPdy5/HRSm+Yj6okJ6UtLINN0Q9M4+h3I=
 github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_golang v0.8.0/go.mod h1:7SWBe2y4D6OKWSNQJUaRYU/AaXPKyh/dDVn+NZz0KFw=

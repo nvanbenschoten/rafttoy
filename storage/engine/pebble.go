@@ -3,12 +3,14 @@ package engine
 import (
 	"bytes"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
+	"github.com/nvanbenschoten/raft-toy/util/raftentry"
 	pdb "github.com/petermattis/pebble"
 	"github.com/petermattis/pebble/db"
 	"go.etcd.io/etcd/raft"
@@ -29,6 +31,7 @@ type pebble struct {
 	db   *pdb.DB
 	opts *db.Options
 	dir  string
+	c    logCache
 }
 
 // NewPebble creates an LSM-based storage engine using Pebble.
@@ -44,7 +47,12 @@ func NewPebble(root string, disableWAL bool) Engine {
 	if err != nil {
 		log.Fatal(err)
 	}
-	return &pebble{db: db, opts: opts, dir: dir}
+	return &pebble{
+		db:   db,
+		opts: opts,
+		dir:  dir,
+		c:    makeLogCache(),
+	}
 }
 
 func randDir(root string) string {
@@ -131,6 +139,24 @@ func decodeRaftLogKey(k []byte) uint64 {
 	return v
 }
 
+// logCache remembers a few facts about the Raft log.
+type logCache struct {
+	lastIndex uint64
+	lastTerm  uint64
+	ec        *raftentry.Cache
+}
+
+func makeLogCache() logCache {
+	return logCache{lastIndex: 0, ec: raftentry.NewCache(4 << 20)}
+}
+
+func (c *logCache) updateForEnts(ents []raftpb.Entry) {
+	last := ents[len(ents)-1]
+	c.lastIndex = last.Index
+	c.lastTerm = last.Term
+	c.ec.Add(0, ents, true)
+}
+
 func (p *pebble) Append(ents []raftpb.Entry) {
 	if len(ents) == 0 {
 		return
@@ -138,6 +164,7 @@ func (p *pebble) Append(ents []raftpb.Entry) {
 	b := p.db.NewBatch()
 	appendEntsToBatch(b, ents)
 	b.Commit(db.Sync)
+	p.c.updateForEnts(ents)
 }
 
 func appendEntsToBatch(b *pdb.Batch, ents []raftpb.Entry) {
@@ -158,11 +185,20 @@ func appendEntsToBatch(b *pdb.Batch, ents []raftpb.Entry) {
 }
 
 func (p *pebble) Entries(lo, hi uint64) []raftpb.Entry {
+	n := hi - lo
+	if n > 100 {
+		n = 100
+	}
+	ents := make([]raftpb.Entry, 0, n)
+	ents, _, hitIndex, _ := p.c.ec.Scan(ents, 0, lo, hi, math.MaxUint64)
+	if uint64(len(ents)) == hi-lo {
+		return ents
+	}
+
 	var kLoArr, kHiArr [maxLogKeyLen]byte
-	kLo := kLoArr[:encodeRaftLogKey(kLoArr[:], lo)]
+	kLo := kLoArr[:encodeRaftLogKey(kLoArr[:], hitIndex)]
 	kHi := kHiArr[:encodeRaftLogKey(kHiArr[:], hi)]
 
-	var ents []raftpb.Entry
 	it := p.db.NewIter(nil)
 	for valid := it.SeekGE(kLo); valid && bytes.Compare(it.Key(), kHi) < 0; valid = it.Next() {
 		ents = append(ents, raftpb.Entry{})
@@ -177,6 +213,13 @@ func (p *pebble) Entries(lo, hi uint64) []raftpb.Entry {
 }
 
 func (p *pebble) Term(i uint64) uint64 {
+	if p.c.lastIndex == i && p.c.lastTerm != 0 {
+		return p.c.lastTerm
+	}
+	if e, ok := p.c.ec.Get(0, i); ok {
+		return e.Term
+	}
+
 	var kArr [maxLogKeyLen]byte
 	k := kArr[:encodeRaftLogKey(kArr[:], i)]
 
@@ -196,37 +239,16 @@ func (p *pebble) Term(i uint64) uint64 {
 }
 
 func (p *pebble) LastIndex() uint64 {
-	it := p.db.NewIter(nil)
-	defer it.Close()
-	it.SeekLT(maxLogKey)
-	for !it.Valid() || bytes.Compare(it.Key(), minLogKey) < 0 {
-		// See raft.MemoryStorage.LastIndex.
-		return 0
-	}
-	i := decodeRaftLogKey(it.Key())
-	if err := it.Close(); err != nil {
-		log.Fatal(err)
-	}
-	return i
+	return p.c.lastIndex
 }
 
 func (p *pebble) FirstIndex() uint64 {
-	it := p.db.NewIter(nil)
-	defer it.Close()
-	it.SeekGE(minLogKey)
-	for !it.Valid() || bytes.Compare(it.Key(), maxLogKey) > 0 {
-		// See raft.MemoryStorage.FirstIndex.
-		return 1
-	}
-	i := decodeRaftLogKey(it.Key())
-	if err := it.Close(); err != nil {
-		log.Fatal(err)
-	}
-	return i
+	return 1
 }
 
 func (p *pebble) Truncate() {
 	p.Clear()
+	p.c = makeLogCache()
 }
 
 //////////////////////////////////////////////////////
@@ -241,6 +263,7 @@ func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState,
 	b := p.db.NewBatch()
 	if len(ents) > 0 {
 		appendEntsToBatch(b, ents)
+		p.c.updateForEnts(ents)
 	}
 	if !raft.IsEmptyHardState(st) {
 		buf, err := st.Marshal()
