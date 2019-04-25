@@ -48,7 +48,8 @@ func newPeer(epoch int32) *peer.Peer {
 }
 
 func main() {
-	printMetrics := metric.Enable(recordMetrics)
+
+	printMetrics := metric.Enable(*recordMetrics)
 	defer printMetrics()
 
 	p := newPeer(0)
@@ -64,7 +65,7 @@ func main() {
 	}()
 
 	// If we're not running load, we enter follower mode.
-	if !runLoad {
+	if !*runLoad {
 		p.Run()
 		return
 	}

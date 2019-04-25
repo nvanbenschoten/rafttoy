@@ -22,7 +22,7 @@ func newEpoch() int32 {
 }
 
 func TestMain(m *testing.M) {
-	defer metric.Enable(recordMetrics)()
+	defer metric.Enable(*recordMetrics)()
 	m.Run()
 }
 
