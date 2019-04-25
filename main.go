@@ -29,13 +29,13 @@ func newPeer(epoch int32) *peer.Peer {
 	// Storage.
 	//  WAL.
 	// w := wal.NewMem()
-	// w := engine.NewPebble().(wal.Wal)
+	// w := engine.NewPebble(*dataDir).(wal.Wal)
 	//  Engine.
 	// e := engine.NewMem()
-	// e := engine.NewPebble()
+	// e := engine.NewPebble(*dataDir)
 	//  Combined.
 	// s := storage.CombineWalAndEngine(w, e)
-	s := engine.NewPebble().(storage.Storage)
+	s := engine.NewPebble(*dataDir).(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()

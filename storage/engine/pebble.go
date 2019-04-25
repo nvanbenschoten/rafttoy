@@ -2,7 +2,6 @@ package engine
 
 import (
 	"bytes"
-	"encoding/binary"
 	"log"
 	"math/rand"
 	"os"
@@ -18,9 +17,13 @@ import (
 
 const dirPrefix = "pebble-data"
 
-var minDataKey = []byte{0x00}
-var maxDataKey = []byte{0x01}
-var hardStateKey = append(minDataKey, []byte("hard-state")...)
+var minMetaKey = []byte{0x00}
+var maxMetaKey = []byte{0x01}
+var minDataKey = maxMetaKey
+var maxDataKey = []byte{0x02}
+var minLogKey = maxDataKey
+var maxLogKey = []byte{0x03}
+var hardStateKey = append(minMetaKey, []byte("hs")...)
 
 type pebble struct {
 	db  *pdb.DB
@@ -28,8 +31,8 @@ type pebble struct {
 }
 
 // NewPebble creates an LSM-based storage engine using Pebble.
-func NewPebble() Engine {
-	dir := randDir()
+func NewPebble(root string) Engine {
+	dir := randDir(root)
 	db, err := pdb.Open(dir, &db.Options{})
 	if err != nil {
 		log.Fatal(err)
@@ -37,8 +40,8 @@ func NewPebble() Engine {
 	return &pebble{db: db, dir: dir}
 }
 
-func randDir() string {
-	return filepath.Join(dirPrefix, strconv.FormatUint(rand.Uint64(), 10))
+func randDir(root string) string {
+	return filepath.Join(root, dirPrefix, strconv.FormatUint(rand.Uint64(), 10))
 }
 
 func (p *pebble) SetHardState(st raftpb.HardState) {
@@ -60,8 +63,11 @@ func (p *pebble) ApplyEntry(ent raftpb.Entry) {
 
 func (p *pebble) Clear() {
 	p.Close()
-	n := NewPebble().(*pebble)
-	*p = *n
+	db, err := pdb.Open(p.dir, &db.Options{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	p.db = db
 }
 
 func (p *pebble) Close() {
@@ -78,10 +84,7 @@ func (p *pebble) Close() {
 // the Raft log by implementing wal.Wal.
 //////////////////////////////////////////
 
-var minLogKey = []byte{0x01}
-var maxLogKey = []byte{0x02}
-
-const maxLogKeyLen = 1 + binary.MaxVarintLen64
+const maxLogKeyLen = 10
 
 func encodeRaftLogKey(k []byte, v uint64) int {
 	k = append(k[:0], minLogKey...)
@@ -216,9 +219,7 @@ func (p *pebble) FirstIndex() uint64 {
 }
 
 func (p *pebble) Truncate() {
-	p.Close()
-	n := NewPebble().(*pebble)
-	*p = *n
+	p.Clear()
 }
 
 //////////////////////////////////////////////////////
