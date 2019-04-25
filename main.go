@@ -30,8 +30,8 @@ func newPeer(epoch int32) *peer.Peer {
 	w := wal.NewMem()
 	// w := engine.NewPebble().(wal.Wal)
 	//  Engine.
-	// e := engine.NewMem()
-	e := engine.NewPebble()
+	e := engine.NewMem()
+	// e := engine.NewPebble()
 	//  Combined.
 	s := storage.CombineWalAndEngine(w, e)
 	// s := engine.NewPebble().(storage.Storage)

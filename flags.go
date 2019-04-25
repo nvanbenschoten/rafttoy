@@ -11,16 +11,14 @@ import (
 )
 
 var raftID uint64
-var raftPeerIDs []int
-var raftPeerAddrs []string
+var raftPeers []string
 var runLoad bool
 var verbose bool
 
 func init() {
 	pflag.Uint64Var(&raftID, "id", 1, "raft.Config.ID")
-	pflag.IntSliceVar(&raftPeerIDs, "peer-ids", []int{1}, "raft.Peers")
-	pflag.StringSliceVar(&raftPeerAddrs, "peer-addrs", []string{"localhost:1234"}, "IP addresses for raft.Peers")
-	pflag.BoolVar(&runLoad, "run-load", false, "Propose changes to raft")
+	pflag.StringSliceVar(&raftPeers, "peers", []string{"localhost:1234"}, "IP addresses for raft.Peers")
+	pflag.BoolVar(&runLoad, "load", false, "Propose changes to raft")
 	pflag.BoolVar(&verbose, "verbose", false, "Verbose logging")
 	pflag.Parse()
 
@@ -37,26 +35,19 @@ func init() {
 
 func parseFlags() peer.PeerConfig {
 	cfg := peer.PeerConfig{ID: raftID}
-
-	self := -1
-	cfg.Peers = make([]raft.Peer, len(raftPeerIDs))
-	for i, id := range raftPeerIDs {
-		cfg.Peers[i] = raft.Peer{ID: uint64(id)}
-		if uint64(id) == cfg.ID {
-			self = i
-		}
+	if cfg.ID == 0 {
+		log.Fatalf("invalid ID (%d); must be > 0", cfg.ID)
 	}
-	if self == -1 {
-		log.Fatalf("missing own ID (%d) in peers (%v)", cfg.ID, cfg.Peers)
+	if len(raftPeers) < int(cfg.ID) {
+		log.Fatalf("missing own ID (%d) in peers (%v)", cfg.ID, raftPeers)
 	}
-
-	if len(raftPeerAddrs) != len(cfg.Peers) {
-		log.Fatalf("missing peer ip mapping")
+	cfg.Peers = make([]raft.Peer, len(raftPeers))
+	cfg.PeerAddrs = make(map[uint64]string, len(raftPeers))
+	for i, addr := range raftPeers {
+		pID := uint64(i + 1)
+		cfg.Peers[i].ID = pID
+		cfg.PeerAddrs[pID] = addr
 	}
-	cfg.SelfAddr = raftPeerAddrs[self]
-	cfg.PeerAddrs = make(map[uint64]string, len(cfg.Peers))
-	for i, p := range cfg.Peers {
-		cfg.PeerAddrs[p.ID] = raftPeerAddrs[i]
-	}
+	cfg.SelfAddr = cfg.PeerAddrs[cfg.ID]
 	return cfg
 }
