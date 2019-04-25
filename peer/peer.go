@@ -11,9 +11,9 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/transport"
+	transpb "github.com/nvanbenschoten/raft-toy/transport/transportpb"
 	"github.com/nvanbenschoten/raft-toy/util"
 	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
 )
 
 // Peer is a member of a Raft consensus group. Its primary roles are to:
@@ -21,11 +21,10 @@ import (
 // 2. periodically tick the Raft RawNode
 // 3. serve as a scheduler for Raft proposal pipeline events
 type Peer struct {
-	mu     sync.RWMutex
-	sig    sync.Cond // signaled to wake-up Raft loop
-	revSig sync.Cond // signaled to wake-up waiting proposers
-	done   int32
-	wg     sync.WaitGroup
+	mu   sync.Mutex
+	sig  chan struct{} // signaled to wake-up Raft loop
+	done int32
+	wg   sync.WaitGroup
 
 	cfg Config
 	n   *raft.RawNode
@@ -36,6 +35,9 @@ type Peer struct {
 	pi int64
 	pb propBuf
 	pt proposal.Tracker
+
+	msgs            chan *transpb.RaftMsg
+	flushPropElemFn func(propBufElem)
 }
 
 // Config contains configurations for constructing a Peer.
@@ -74,18 +76,20 @@ func New(
 	}
 
 	p := &Peer{
-		cfg: cfg,
-		n:   n,
-		s:   s,
-		t:   t,
-		pl:  pl,
-		pt:  proposal.MakeTracker(),
+		sig:  make(chan struct{}, 1),
+		cfg:  cfg,
+		n:    n,
+		s:    s,
+		t:    t,
+		pl:   pl,
+		pt:   proposal.MakeTracker(),
+		msgs: make(chan *transpb.RaftMsg, 256),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
 	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)
+	p.pb.init()
+	p.flushPropElemFn = p.flushPropElem
 	go p.t.Serve(p)
-	p.sig.L = &p.mu
-	p.revSig.L = p.mu.RLocker()
 	return p
 }
 
@@ -96,17 +100,27 @@ func (p *Peer) Run() {
 	go p.ticker()
 	defer p.wg.Done()
 
-	p.mu.Lock()
 	for {
-		for p.pb.lenWLocked() == 0 && !p.n.HasReady() {
-			if p.stopped() {
-				p.mu.Unlock()
-				return
-			}
-			p.sig.Wait()
+		<-p.sig
+		if p.stopped() {
+			p.mu.Lock()
+			p.pb.flush(p.flushPropElemFn)
+			p.mu.Unlock()
+			return
 		}
-		p.flushPropsLocked()
+		p.mu.Lock()
+		p.pb.flush(p.flushPropElemFn)
+		p.flushMsgs()
 		p.pl.RunOnce()
+		p.mu.Unlock()
+	}
+}
+
+func (p *Peer) signal() {
+	select {
+	case p.sig <- struct{}{}:
+	default:
+		// Already signaled.
 	}
 }
 
@@ -119,14 +133,14 @@ func (p *Peer) ticker() {
 		p.mu.Lock()
 		p.n.Tick()
 		p.mu.Unlock()
-		p.sig.Signal()
+		p.signal()
 	}
 }
 
 // Stop stops all processing and releases all resources held by Peer.
 func (p *Peer) Stop() {
 	atomic.StoreInt32(&p.done, 1)
-	p.sig.Signal()
+	p.signal()
 	p.t.Close()
 	p.wg.Wait()
 	p.pt.FinishAll()
@@ -144,7 +158,7 @@ func (p *Peer) Campaign() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.n.Campaign()
-	p.sig.Signal()
+	p.signal()
 }
 
 // Propose proposes the provided update to the Raft state machine.
@@ -154,51 +168,49 @@ func (p *Peer) Propose(prop proposal.Proposal) bool {
 	c := make(chan bool, 1)
 	el := propBufElem{enc, c}
 
-	p.mu.RLock()
-	for !p.pb.addRLocked(el) {
-		p.revSig.Wait()
-	}
-	p.mu.RUnlock()
-
-	p.sig.Signal()
+	p.pb.add(el)
+	p.signal()
 	if p.stopped() {
 		return false
 	}
 	return <-c
 }
 
-func (p *Peer) flushPropsLocked() {
-	b := p.pb.flushWLocked()
-	for _, e := range b {
-		err := p.n.Propose(e.enc)
-		if err != nil {
-			e.c <- false
-		} else {
-			p.pt.Register(e.enc, e.c)
-		}
-	}
-	if len(b) == propBufCap {
-		p.revSig.Broadcast()
+func (p *Peer) flushPropElem(e propBufElem) {
+	err := p.n.Propose(e.enc)
+	if err != nil {
+		e.c <- false
+	} else {
+		p.pt.Register(e.enc, e.c)
 	}
 }
 
 // HandleMessage implements transport.RaftHandler.
-func (p *Peer) HandleMessage(epoch int32, msg *raftpb.Message) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if epoch < p.cfg.Epoch {
-		return
-	}
-	if epoch > p.cfg.Epoch {
-		log.Printf("bumping test epoch to %d", epoch)
-		p.bumpEpochLocked(epoch)
-	}
-	p.n.Step(*msg)
-	p.sig.Signal()
+func (p *Peer) HandleMessage(m *transpb.RaftMsg) {
+	p.msgs <- m
+	p.signal()
 }
 
-func (p *Peer) bumpEpochLocked(epoch int32) {
-	if p.pb.lenWLocked() > 0 || p.pt.Len() > 0 {
+func (p *Peer) flushMsgs() {
+	for {
+		select {
+		case m := <-p.msgs:
+			if m.Epoch < p.cfg.Epoch {
+				return
+			}
+			if m.Epoch > p.cfg.Epoch {
+				log.Printf("bumping test epoch to %d", m.Epoch)
+				p.bumpEpoch(m.Epoch)
+			}
+			p.n.Step(*m.Msg)
+		default:
+			return
+		}
+	}
+}
+
+func (p *Peer) bumpEpoch(epoch int32) {
+	if p.pt.Len() > 0 {
 		log.Fatal("cannot reset peer with in-flight proposals")
 	}
 	// Clear all persistent state and create a new Raft node.

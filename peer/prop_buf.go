@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
@@ -9,8 +10,10 @@ import (
 const propBufCap = 64
 
 type propBuf struct {
-	b [propBufCap]propBufElem
-	i int32
+	mu   sync.RWMutex
+	full sync.Cond
+	b    [propBufCap]propBufElem
+	i    int32
 }
 
 type propBufElem struct {
@@ -18,25 +21,34 @@ type propBufElem struct {
 	c   chan bool
 }
 
-func (b *propBuf) addRLocked(e propBufElem) bool {
-	n := atomic.AddInt32(&b.i, 1)
-	i := int(n - 1)
-	if i >= len(b.b) {
-		return false
+func (b *propBuf) init() {
+	b.full.L = b.mu.RLocker()
+}
+
+func (b *propBuf) add(e propBufElem) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for {
+		n := atomic.AddInt32(&b.i, 1)
+		i := int(n - 1)
+		if i < len(b.b) {
+			b.b[i] = e
+			return
+		}
+		b.full.Wait()
 	}
-	b.b[i] = e
-	return true
 }
 
-func (b *propBuf) lenWLocked() int {
-	return int(b.i)
-}
-
-func (b *propBuf) flushWLocked() []propBufElem {
+func (b *propBuf) flush(f func(propBufElem)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	i := int(b.i)
-	if i > len(b.b) {
+	if i >= len(b.b) {
 		i = len(b.b)
+		b.full.Broadcast()
+	}
+	for _, e := range b.b[:i] {
+		f(e)
 	}
 	b.i = 0
-	return b.b[:i]
 }

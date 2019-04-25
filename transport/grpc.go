@@ -76,7 +76,7 @@ func (g *grpc) RaftMessage(stream transpb.RaftService_RaftMessageServer) error {
 		if err != nil {
 			return err
 		}
-		g.handler.HandleMessage(in.Epoch, in.Msg)
+		g.handler.HandleMessage(in)
 	}
 }
 
@@ -119,7 +119,7 @@ func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {
 			log.Fatalf("error when dialing %d: %v", to, err)
 		}
 	}
-	c := make(chan *transpb.RaftMsg, 1024)
+	c := make(chan *transpb.RaftMsg, 256)
 	g.clientBufs[to] = c
 	go g.sender(to, conn, c)
 }
