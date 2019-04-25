@@ -7,13 +7,22 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
+var enabled bool
+
 // Enable enables or disables metric collection.
 func Enable(b bool) func() {
 	if !b {
+		enabled = false
 		return func() {}
 	}
+	enabled = true
 	registerAll()
 	return printMetrics
+}
+
+// Enabled returns whether metric collection is enabled.
+func Enabled() bool {
+	return enabled
 }
 
 // AppendBatchSizesHistogram records the size of Raft entry batches
@@ -24,6 +33,10 @@ var AppendBatchSizesHistogram metrics.Histogram = metrics.NilHistogram{}
 // as they are applied to the storage engine.
 var ApplyBatchSizesHistogram metrics.Histogram = metrics.NilHistogram{}
 
+// PipelineLatencyHistogram records the latency of single Raft proposal
+// pipeline iterations.
+var PipelineLatencyHistogram metrics.Histogram = metrics.NilHistogram{}
+
 func registerAll() {
 	AppendBatchSizesHistogram = metrics.NewRegisteredHistogram(
 		"append_batch_sizes",
@@ -32,6 +45,11 @@ func registerAll() {
 	)
 	ApplyBatchSizesHistogram = metrics.NewRegisteredHistogram(
 		"apply_batch_sizes",
+		metrics.DefaultRegistry,
+		metrics.NewUniformSample(1024),
+	)
+	PipelineLatencyHistogram = metrics.NewRegisteredHistogram(
+		"pipeline_latency_us",
 		metrics.DefaultRegistry,
 		metrics.NewUniformSample(1024),
 	)

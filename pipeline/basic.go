@@ -47,6 +47,7 @@ func (pl *basic) BumpEpoch(epoch int32, n *raft.RawNode) {
 }
 
 func (pl *basic) RunOnce() {
+	defer measurePipelineLat()()
 	rd := pl.n.Ready()
 	pl.l.Unlock()
 	saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"log"
 	"sync"
+	"time"
 
 	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/proposal"
@@ -21,6 +22,17 @@ type Pipeline interface {
 	Start()
 	Stop()
 	RunOnce()
+}
+
+func measurePipelineLat() func() {
+	if !metric.Enabled() {
+		return func() {}
+	}
+	start := time.Now()
+	return func() {
+		lat := time.Since(start)
+		metric.PipelineLatencyHistogram.Update(int64(lat / time.Microsecond))
+	}
 }
 
 func saveToDisk(s storage.Storage, ents []raftpb.Entry, st raftpb.HardState, sync bool) {
@@ -43,6 +55,18 @@ func sendMessages(t transport.Transport, epoch int32, msgs []raftpb.Message) {
 	if len(msgs) > 0 {
 		t.Send(epoch, msgs)
 	}
+}
+
+// Stolen from cockroachdb/cockroach/pkg/storage/replica_raft.go.
+func splitMsgApps(msgs []raftpb.Message) (msgApps, otherMsgs []raftpb.Message) {
+	splitIdx := 0
+	for i, msg := range msgs {
+		if msg.Type == raftpb.MsgApp {
+			msgs[i], msgs[splitIdx] = msgs[splitIdx], msgs[i]
+			splitIdx++
+		}
+	}
+	return msgs[:splitIdx], msgs[splitIdx:]
 }
 
 func processSnapshot(sn raftpb.Snapshot) {

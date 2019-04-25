@@ -35,13 +35,16 @@ func NewAsyncApplier(earlyAck bool) Pipeline {
 }
 
 func (pl *asyncApplier) RunOnce() {
+	defer measurePipelineLat()()
 	rd := pl.n.Ready()
 	if pl.earlyAck {
 		pl.ackCommittedEnts(rd.CommittedEntries)
 	}
 	pl.l.Unlock()
+	msgApps, otherMsgs := splitMsgApps(rd.Messages)
+	sendMessages(pl.t, pl.epoch, msgApps)
 	saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)
-	sendMessages(pl.t, pl.epoch, rd.Messages)
+	sendMessages(pl.t, pl.epoch, otherMsgs)
 	processSnapshot(rd.Snapshot)
 	pl.maybeApplyAsync(rd.CommittedEntries)
 	pl.l.Lock()
