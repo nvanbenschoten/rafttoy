@@ -21,7 +21,7 @@ func newEpoch() int32 {
 }
 
 func BenchmarkRaft(b *testing.B) {
-	runFor(b, "conc", 1, 3, 5, func(b *testing.B, conc int) {
+	runFor(b, "conc", 1, 1, 10, func(b *testing.B, conc int) {
 		runFor(b, "bytes", 1, 4, 4, func(b *testing.B, bytes int) {
 			benchmarkRaft(b, conc, bytes)
 		})
@@ -43,12 +43,13 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 	}
 
 	b.ResetTimer()
-	b.SetBytes(int64(conc * bytes))
+	b.SetBytes(int64(bytes))
 	var g errgroup.Group
 	defer g.Wait()
 	for i := 0; i < conc; i++ {
 		g.Go(func() error {
-			for j := 0; j < b.N; j++ {
+			iters := b.N / conc
+			for j := 0; j < iters; j++ {
 				if !p.Propose(prop) {
 					return errors.New("proposal failed")
 				}

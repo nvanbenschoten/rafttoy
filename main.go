@@ -14,6 +14,7 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/storage/engine"
+	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/transport"
 )
 
@@ -26,14 +27,14 @@ func newPeer(epoch int32) *peer.Peer {
 
 	// Storage.
 	//  WAL.
-	// w := wal.NewMem()
+	w := wal.NewMem()
 	// w := engine.NewPebble().(wal.Wal)
 	//  Engine.
 	// e := engine.NewMem()
-	// e := engine.NewPebble()
+	e := engine.NewPebble()
 	//  Combined.
-	// s := storage.CombineWalAndEngine(w, e)
-	s := engine.NewPebble().(storage.Storage)
+	s := storage.CombineWalAndEngine(w, e)
+	// s := engine.NewPebble().(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()

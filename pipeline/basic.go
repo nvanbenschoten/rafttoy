@@ -43,7 +43,7 @@ func (b *basic) RunOnce(l sync.Locker) {
 	b.saveToDisk(rd.Entries, rd.HardState, rd.MustSync)
 	b.sendMessages(rd.Messages)
 	b.processSnapshot(rd.Snapshot)
-	b.applyToStore(rd.CommittedEntries)
+	b.applyToStore(l, rd.CommittedEntries)
 	l.Lock()
 	b.n.Advance(rd)
 }
@@ -73,7 +73,7 @@ func (b *basic) processSnapshot(sn raftpb.Snapshot) {
 	}
 }
 
-func (b *basic) applyToStore(ents []raftpb.Entry) {
+func (b *basic) applyToStore(l sync.Locker, ents []raftpb.Entry) {
 	for _, e := range ents {
 		switch e.Type {
 		case raftpb.EntryNormal:
@@ -82,7 +82,9 @@ func (b *basic) applyToStore(ents []raftpb.Entry) {
 			}
 			b.s.ApplyEntry(e)
 			ec := proposal.EncProposal(e.Data)
+			l.Lock()
 			b.pt.Finish(ec.GetID())
+			l.Unlock()
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
 			cc.Unmarshal(e.Data)

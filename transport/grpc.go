@@ -43,20 +43,27 @@ func (g *grpc) Serve(h RaftHandler) {
 	g.handler = h
 
 	var lis net.Listener
-	for {
+	for i := 0; ; i++ {
 		var err error
 		lis, err = net.Listen("tcp", g.addr)
 		if err == nil {
 			break
 		}
 		if strings.Contains(err.Error(), "address already in use") {
-			log.Printf("waiting to listen %v", err)
+			if i > 16 {
+				log.Printf("waiting to listen %v", err)
+			}
 			continue
 		}
 		log.Fatal(err)
 	}
+
 	if err := g.rpc.Serve(lis); err != nil {
-		log.Fatal(err)
+		switch err {
+		case rpc.ErrServerStopped:
+		default:
+			log.Fatal(err)
+		}
 	}
 }
 
