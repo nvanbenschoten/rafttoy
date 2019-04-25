@@ -41,11 +41,6 @@ func (pl *basic) Init(
 	pl.pt = pt
 }
 
-func (pl *basic) BumpEpoch(epoch int32, n *raft.RawNode) {
-	pl.epoch = epoch
-	pl.n = n
-}
-
 func (pl *basic) RunOnce() {
 	defer measurePipelineLat()()
 	rd := pl.n.Ready()
@@ -59,4 +54,9 @@ func (pl *basic) RunOnce() {
 }
 
 func (pl *basic) Start() {}
-func (pl *basic) Stop()  {}
+func (pl *basic) Pause() {}
+func (pl *basic) Resume(epoch int32, n *raft.RawNode) {
+	pl.epoch = epoch
+	pl.n = n
+}
+func (pl *basic) Stop() {}

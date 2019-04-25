@@ -216,14 +216,15 @@ func (p *Peer) bumpEpoch(epoch int32) {
 		log.Fatal("cannot reset peer with in-flight proposals")
 	}
 	// Clear all persistent state and create a new Raft node.
-	p.cfg.Epoch = epoch
+	p.pl.Pause()
 	p.s.Truncate()
 	p.s.Clear()
+	p.cfg.Epoch = epoch
 	raftCfg := makeRaftCfg(p.cfg, p.s)
 	n, err := raft.NewRawNode(raftCfg, p.cfg.Peers)
 	if err != nil {
 		log.Fatal(err)
 	}
 	p.n = n
-	p.pl.BumpEpoch(epoch, n)
+	p.pl.Resume(epoch, n)
 }

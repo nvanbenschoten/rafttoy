@@ -19,8 +19,9 @@ import (
 // the Raft "raw node" needs to coordinate with.
 type Pipeline interface {
 	Init(int32, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker)
-	BumpEpoch(int32, *raft.RawNode)
 	Start()
+	Pause()
+	Resume(int32, *raft.RawNode)
 	Stop()
 	RunOnce()
 }

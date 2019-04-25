@@ -126,6 +126,13 @@ func (pl *asyncApplier) Start() {
 	}()
 }
 
+func (pl *asyncApplier) Pause() {
+	// Flush toApply channel.
+	syncC := make(chan struct{})
+	pl.toApply <- asyncEvent{sync: syncC}
+	<-syncC
+}
+
 func (pl *asyncApplier) Stop() {
 	stoppedC := make(chan struct{})
 	pl.toApply <- asyncEvent{stop: stoppedC}
