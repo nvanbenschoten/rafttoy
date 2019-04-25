@@ -155,6 +155,8 @@ func (g *grpc) sender(to uint64, conn *rpc.ClientConn, c <-chan *transpb.RaftMsg
 		}
 	}
 	for m := range c {
+		// TODO This doesn't seem to help performance.
+		// compressMsg(m)
 		if err := stream.Send(m); err != nil {
 			switch err {
 			case context.Canceled:
@@ -165,6 +167,42 @@ func (g *grpc) sender(to uint64, conn *rpc.ClientConn, c <-chan *transpb.RaftMsg
 				log.Fatal(err)
 			}
 		}
+	}
+}
+
+func compressMsg(m *transpb.RaftMsg) {
+	old := m.Msgs
+	m.Msgs = m.Msgs[:0]
+	var lastAppResp raftpb.Message
+	for i := range old {
+		mm := &old[i]
+		switch mm.Type {
+		case raftpb.MsgApp:
+		case raftpb.MsgAppResp:
+			// A successful (non-reject) MsgAppResp contains one piece of
+			// information: the highest log index. Raft currently queues up
+			// one MsgAppResp per incoming MsgApp, and we may process
+			// multiple messages in one handleRaftReady call (because
+			// multiple messages may arrive while we're blocked syncing to
+			// disk). If we get redundant MsgAppResps, drop all but the
+			// last (we've seen that too many MsgAppResps can overflow
+			// message queues on the receiving side).
+			//
+			// Note that this reorders the chosen MsgAppResp relative to
+			// other messages (including any MsgAppResps with the Reject flag),
+			// but raft is fine with this reordering.
+			if !mm.Reject {
+				if lastAppResp.Type == 0 || mm.Index > lastAppResp.Index {
+					lastAppResp = *mm
+				}
+				continue
+			}
+		default:
+		}
+		m.Msgs = append(m.Msgs, *mm)
+	}
+	if lastAppResp.Type != 0 {
+		m.Msgs = append(m.Msgs, lastAppResp)
 	}
 }
 
