@@ -30,7 +30,7 @@ type asyncEvent struct {
 func NewAsyncApplier(earlyAck bool) Pipeline {
 	return &asyncApplier{
 		earlyAck: earlyAck,
-		toApply:  make(chan asyncEvent, 128),
+		toApply:  make(chan asyncEvent, 512),
 	}
 }
 

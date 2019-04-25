@@ -1,10 +1,24 @@
 package util
 
-import "go.etcd.io/etcd/raft"
+import (
+	"log"
+	"os"
 
-// DisableRaftLogging disables all logging from inside etcd/raft.
-func DisableRaftLogging() {
-	raft.SetLogger(discardLogger{})
+	"go.etcd.io/etcd/raft"
+)
+
+// SetRaftLoggingVerbosity sets the logger inside etcd/raft.
+func SetRaftLoggingVerbosity(verbose bool) {
+	var l raft.Logger
+	if verbose {
+		def := &raft.DefaultLogger{Logger: log.New(os.Stderr, "raft", log.LstdFlags)}
+		def.EnableDebug()
+		def.EnableTimestamps()
+		l = def
+	} else {
+		l = discardLogger{}
+	}
+	raft.SetLogger(l)
 }
 
 type discardLogger struct{}

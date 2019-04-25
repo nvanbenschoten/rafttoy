@@ -131,7 +131,7 @@ func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {
 			log.Fatalf("error when dialing %d: %v", to, err)
 		}
 	}
-	c := make(chan *transpb.RaftMsg, 256)
+	c := make(chan *transpb.RaftMsg, 1024)
 	g.clientBufs[to] = c
 	go g.sender(to, conn, c)
 }

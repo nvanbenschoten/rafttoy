@@ -83,7 +83,7 @@ func New(
 		t:    t,
 		pl:   pl,
 		pt:   proposal.MakeTracker(),
-		msgs: make(chan *transpb.RaftMsg, 256),
+		msgs: make(chan *transpb.RaftMsg, 1024),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
 	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)

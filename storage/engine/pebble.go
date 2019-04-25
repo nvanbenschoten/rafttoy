@@ -161,11 +161,14 @@ func decodeRaftLogKey(k []byte) uint64 {
 	return v
 }
 
+const cacheSizeTarget = 2048
+
 // logCache remembers a few facts about the Raft log.
 type logCache struct {
-	lastIndex uint64
-	lastTerm  uint64
-	ec        *raftentry.Cache
+	lastIndex  uint64
+	lastTerm   uint64
+	truncIndex uint64
+	ec         *raftentry.Cache
 }
 
 func makeLogCache() logCache {
@@ -177,6 +180,10 @@ func (c *logCache) updateForEnts(ents []raftpb.Entry) {
 	c.lastIndex = last.Index
 	c.lastTerm = last.Term
 	c.ec.Add(0, ents, true)
+	if last.Index >= c.truncIndex+2*cacheSizeTarget {
+		c.truncIndex = last.Index - cacheSizeTarget
+		c.ec.Clear(0, c.truncIndex)
+	}
 }
 
 func (p *pebble) Append(ents []raftpb.Entry) {

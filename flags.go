@@ -39,10 +39,7 @@ func init() {
 		}
 	})
 	pflag.Parse()
-
-	if !*verbose {
-		util.DisableRaftLogging()
-	}
+	util.SetRaftLoggingVerbosity(*verbose)
 }
 
 func cfgFromFlags() peer.Config {
