@@ -1,16 +1,16 @@
 package transport
 
-import (
-	"go.etcd.io/etcd/raft/raftpb"
-)
+import "go.etcd.io/etcd/raft/raftpb"
 
+// Transport handles RPC messages for Raft coordination.
 type Transport interface {
-	Init(string, map[uint64]string)
+	Init(addr string, peers map[uint64]string)
 	Serve(RaftHandler)
-	Send(int32, []raftpb.Message)
+	Send(epoch int32, msgs []raftpb.Message)
 	Close()
 }
 
+// RaftHandler is an object capable of accepting incoming Raft messages.
 type RaftHandler interface {
-	HandleMessage(int32, *raftpb.Message)
+	HandleMessage(epoch int32, msg *raftpb.Message)
 }

@@ -22,7 +22,7 @@ type grpc struct {
 	dialCtx    context.Context
 	dialCancel func()
 	clientMu   sync.Mutex
-	clientBufs map[uint64]chan *transpb.RaftMsg
+	clientBufs map[uint64]chan<- *transpb.RaftMsg
 }
 
 // NewGRPC creates a new Transport that uses gRPC streams.
@@ -33,14 +33,14 @@ func NewGRPC() Transport {
 func (g *grpc) Init(addr string, peers map[uint64]string) {
 	g.addr = addr
 	g.peers = peers
-	g.clientBufs = make(map[uint64]chan *transpb.RaftMsg)
+	g.clientBufs = make(map[uint64]chan<- *transpb.RaftMsg)
+	g.dialCtx, g.dialCancel = context.WithCancel(context.Background())
+	g.rpc = rpc.NewServer()
+	transpb.RegisterRaftServiceServer(g.rpc, g)
 }
 
 func (g *grpc) Serve(h RaftHandler) {
 	g.handler = h
-	g.rpc = rpc.NewServer()
-	g.dialCtx, g.dialCancel = context.WithCancel(context.Background())
-	transpb.RegisterRaftServiceServer(g.rpc, g)
 
 	var lis net.Listener
 	for {

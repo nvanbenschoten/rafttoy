@@ -35,8 +35,12 @@ var _ = math.Inf
 const _ = proto.GoGoProtoPackageIsVersion2 // please upgrade the proto package
 
 type RaftMsg struct {
-	Epoch int32           `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
-	Msg   *raftpb.Message `protobuf:"bytes,2,opt,name=msg" json:"msg,omitempty"`
+	// Epoch indicates the test epoch that this message was sent from. Raft
+	// state is reset when an epoch increment is detected and Raft messages
+	// from previous epochs are discarded.
+	Epoch int32 `protobuf:"varint,1,opt,name=epoch,proto3" json:"epoch,omitempty"`
+	// Msg is the wrapped Raft message.
+	Msg *raftpb.Message `protobuf:"bytes,2,opt,name=msg" json:"msg,omitempty"`
 }
 
 func (m *RaftMsg) Reset()                    { *m = RaftMsg{} }

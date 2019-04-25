@@ -5,7 +5,11 @@ import "gogoproto/gogo.proto";
 import "go.etcd.io/etcd/raft/raftpb/raft.proto";
 
 message RaftMsg {
+    // Epoch indicates the test epoch that this message was sent from. Raft
+    // state is reset when an epoch increment is detected and Raft messages
+    // from previous epochs are discarded.
     int32        epoch = 1;
+    // Msg is the wrapped Raft message.
     raftpb.Message msg = 2;
 }
 
