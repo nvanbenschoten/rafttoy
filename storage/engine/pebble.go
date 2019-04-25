@@ -168,14 +168,20 @@ func (p *pebble) Append(ents []raftpb.Entry) {
 }
 
 func appendEntsToBatch(b *pdb.Batch, ents []raftpb.Entry) {
+	var buf []byte
 	for i := range ents {
 		ent := &ents[i]
 
 		var kArr [maxLogKeyLen]byte
 		k := kArr[:encodeRaftLogKey(kArr[:], ent.Index)]
 
-		buf, err := ent.Marshal()
-		if err != nil {
+		s := ent.Size()
+		if cap(buf) < s {
+			buf = make([]byte, s)
+		} else {
+			buf = buf[:s]
+		}
+		if _, err := ent.MarshalTo(buf); err != nil {
 			log.Fatal(err)
 		}
 		if err := b.Set(k, buf, nil); err != nil {
