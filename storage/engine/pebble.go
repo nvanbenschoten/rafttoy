@@ -76,6 +76,28 @@ func (p *pebble) ApplyEntry(ent raftpb.Entry) {
 	}
 }
 
+// pebble implements engine.BatchingEngine.
+func (p *pebble) ApplyEntries(ents []raftpb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
+	b := p.db.NewBatch()
+	defer b.Close()
+	for i := range ents {
+		d := ents[i].Data
+		if len(d) == 0 {
+			continue
+		}
+		prop := proposal.Decode(d)
+		if err := b.Set(prop.Key, prop.Val, nil); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := b.Commit(db.Sync); err != nil {
+		log.Fatal(err)
+	}
+}
+
 func (p *pebble) Clear() {
 	p.Close()
 	db, err := pdb.Open(p.dir, p.opts)
@@ -162,8 +184,11 @@ func (p *pebble) Append(ents []raftpb.Entry) {
 		return
 	}
 	b := p.db.NewBatch()
+	defer b.Close()
 	appendEntsToBatch(b, ents)
-	b.Commit(db.Sync)
+	if err := b.Commit(db.Sync); err != nil {
+		log.Fatal(err)
+	}
 	p.c.updateForEnts(ents)
 }
 
@@ -267,6 +292,7 @@ func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState,
 		return
 	}
 	b := p.db.NewBatch()
+	defer b.Close()
 	if len(ents) > 0 {
 		appendEntsToBatch(b, ents)
 		p.c.updateForEnts(ents)
@@ -284,5 +310,7 @@ func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState,
 	if sync {
 		opts = db.Sync
 	}
-	b.Commit(opts)
+	if err := b.Commit(opts); err != nil {
+		log.Fatal(err)
+	}
 }

@@ -22,7 +22,7 @@ func (pl *parallelAppender) RunOnce() {
 	saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)
 	sendMessages(pl.t, pl.epoch, otherMsgs)
 	processSnapshot(rd.Snapshot)
-	applyToStore(pl.n, pl.s, pl.pt, pl.l, rd.CommittedEntries)
+	applyToStore(pl.n, pl.s, pl.pt, pl.l, rd.CommittedEntries, true)
 	pl.l.Lock()
 	pl.n.Advance(rd)
 }

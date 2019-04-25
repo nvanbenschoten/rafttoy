@@ -8,6 +8,7 @@ import (
 	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
+	"github.com/nvanbenschoten/raft-toy/storage/engine"
 	"github.com/nvanbenschoten/raft-toy/transport"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -76,30 +77,78 @@ func processSnapshot(sn raftpb.Snapshot) {
 }
 
 func applyToStore(
-	n *raft.RawNode, s storage.Storage, pt *proposal.Tracker, l sync.Locker, ents []raftpb.Entry,
+	n *raft.RawNode, s storage.Storage, pt *proposal.Tracker, l sync.Locker, ents []raftpb.Entry, ack bool,
 ) {
-	if len(ents) > 0 {
-		metric.ApplyBatchSizesHistogram.Update(int64(len(ents)))
+	if len(ents) == 0 {
+		return
 	}
-	for _, e := range ents {
-		switch e.Type {
-		case raftpb.EntryNormal:
-			if len(e.Data) == 0 {
-				continue
+	metric.ApplyBatchSizesHistogram.Update(int64(len(ents)))
+	if be, ok := s.(engine.BatchingEngine); ok {
+		// Apply all entries at once then ack all entries at once.
+		st := 0
+		for i := range ents {
+			ent := &ents[i]
+			switch ent.Type {
+			case raftpb.EntryNormal:
+			case raftpb.EntryConfChange:
+				// Flush the previous batch.
+				be.ApplyEntries(ents[st:i])
+				st = i + 1
+
+				var cc raftpb.ConfChange
+				cc.Unmarshal(ent.Data)
+				l.Lock()
+				n.ApplyConfChange(cc)
+				l.Unlock()
+			default:
+				panic("unexpected")
 			}
-			s.ApplyEntry(e)
-			ec := proposal.EncProposal(e.Data)
+		}
+		be.ApplyEntries(ents[st:])
+
+		if ack {
 			l.Lock()
-			pt.Finish(ec.GetID())
+			for i := range ents {
+				ent := &ents[i]
+				switch ent.Type {
+				case raftpb.EntryNormal:
+					if len(ent.Data) == 0 {
+						continue
+					}
+					ec := proposal.EncProposal(ent.Data)
+					pt.Finish(ec.GetID())
+				case raftpb.EntryConfChange:
+				default:
+					panic("unexpected")
+				}
+			}
 			l.Unlock()
-		case raftpb.EntryConfChange:
-			var cc raftpb.ConfChange
-			cc.Unmarshal(e.Data)
-			l.Lock()
-			n.ApplyConfChange(cc)
-			l.Unlock()
-		default:
-			panic("unexpected")
+		}
+	} else {
+		// Apply and ack entries, one at a time.
+		for i := range ents {
+			ent := &ents[i]
+			switch ent.Type {
+			case raftpb.EntryNormal:
+				if len(ent.Data) == 0 {
+					continue
+				}
+				s.ApplyEntry(*ent)
+				if ack {
+					ec := proposal.EncProposal(ent.Data)
+					l.Lock()
+					pt.Finish(ec.GetID())
+					l.Unlock()
+				}
+			case raftpb.EntryConfChange:
+				var cc raftpb.ConfChange
+				cc.Unmarshal(ent.Data)
+				l.Lock()
+				n.ApplyConfChange(cc)
+				l.Unlock()
+			default:
+				panic("unexpected")
+			}
 		}
 	}
 }

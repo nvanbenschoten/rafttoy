@@ -83,7 +83,7 @@ func (pl *asyncApplier) maybeApplyAsync(ents []raftpb.Entry) {
 		syncC := make(chan struct{})
 		pl.toApply <- asyncEvent{sync: syncC}
 		<-syncC
-		applyToStore(pl.n, pl.s, pl.pt, pl.l, ents)
+		applyToStore(pl.n, pl.s, pl.pt, pl.l, ents, !pl.earlyAck)
 	} else {
 		// Send to async applier.
 		pl.toApply <- asyncEvent{ents: ents}
