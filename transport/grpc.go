@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 
@@ -81,15 +82,26 @@ func (g *grpc) RaftMessage(stream transpb.RaftService_RaftMessageServer) error {
 }
 
 func (g *grpc) Send(epoch int32, msgs []raftpb.Message) {
-	buf := make([]transpb.RaftMsg, len(msgs))
-	for i := range buf {
-		buf[i].Epoch = epoch
-		buf[i].Msg = &msgs[i]
+	// Group messages by destination and combine.
+	sort.Slice(msgs, func(i, j int) bool {
+		return msgs[i].To < msgs[j].To
+	})
+	st := 0
+	to := msgs[0].To
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].To != to {
+			g.sendAsync(to, &transpb.RaftMsg{
+				Epoch: epoch,
+				Msgs:  msgs[st:i],
+			})
+			to = msgs[i].To
+			st = i
+		}
 	}
-	for i := range buf {
-		m := &buf[i]
-		g.sendAsync(m.Msg.To, m)
-	}
+	g.sendAsync(to, &transpb.RaftMsg{
+		Epoch: epoch,
+		Msgs:  msgs[st:],
+	})
 }
 
 func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {

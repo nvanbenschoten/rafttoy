@@ -202,7 +202,9 @@ func (p *Peer) flushMsgs() {
 				log.Printf("bumping test epoch to %d", m.Epoch)
 				p.bumpEpoch(m.Epoch)
 			}
-			p.n.Step(*m.Msg)
+			for i := range m.Msgs {
+				p.n.Step(m.Msgs[i])
+			}
 		default:
 			return
 		}
