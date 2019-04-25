@@ -26,18 +26,25 @@ var maxLogKey = []byte{0x03}
 var hardStateKey = append(minMetaKey, []byte("hs")...)
 
 type pebble struct {
-	db  *pdb.DB
-	dir string
+	db   *pdb.DB
+	opts *db.Options
+	dir  string
 }
 
 // NewPebble creates an LSM-based storage engine using Pebble.
-func NewPebble(root string) Engine {
+func NewPebble(root string, disableWAL bool) Engine {
+	if disableWAL {
+		log.Fatal("disable wal is currently broken")
+	}
 	dir := randDir(root)
-	db, err := pdb.Open(dir, &db.Options{})
+	opts := &db.Options{
+		DisableWAL: disableWAL,
+	}
+	db, err := pdb.Open(dir, opts)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return &pebble{db: db, dir: dir}
+	return &pebble{db: db, opts: opts, dir: dir}
 }
 
 func randDir(root string) string {
@@ -63,7 +70,7 @@ func (p *pebble) ApplyEntry(ent raftpb.Entry) {
 
 func (p *pebble) Clear() {
 	p.Close()
-	db, err := pdb.Open(p.dir, &db.Options{})
+	db, err := pdb.Open(p.dir, p.opts)
 	if err != nil {
 		log.Fatal(err)
 	}

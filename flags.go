@@ -19,6 +19,7 @@ var runLoad = pflag.Bool("load", false, "Propose changes to Raft")
 var verbose = pflag.Bool("verbose", false, "Verbose logging")
 var recordMetrics = pflag.Bool("metrics", false, "Record metrics and print before exiting")
 var dataDir = pflag.String("data-dir", "", "Directory to store persistent data")
+var pipelineImpl = pflag.String("pipeline", "basic", "Raft proposal pipeline implementation")
 
 func init() {
 	rand.Seed(time.Now().UTC().UnixNano())

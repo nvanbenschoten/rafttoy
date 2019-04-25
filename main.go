@@ -29,21 +29,31 @@ func newPeer(epoch int32) *peer.Peer {
 	// Storage.
 	//  WAL.
 	// w := wal.NewMem()
-	// w := engine.NewPebble(*dataDir).(wal.Wal)
+	// w := engine.NewPebble(*dataDir, false).(wal.Wal)
 	//  Engine.
 	// e := engine.NewMem()
-	// e := engine.NewPebble(*dataDir)
+	// e := engine.NewPebble(*dataDir, true)
 	//  Combined.
 	// s := storage.CombineWalAndEngine(w, e)
-	s := engine.NewPebble(*dataDir).(storage.Storage)
+	s := engine.NewPebble(*dataDir, false).(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
 
 	// Pipeline.
-	pl := pipeline.NewBasic()
-	// pl := pipeline.NewAsyncApplier(false /* earlyAck */)
-	// pl := pipeline.NewAsyncApplier(true /* earlyAck */)
+	var pl pipeline.Pipeline
+	switch *pipelineImpl {
+	case "basic":
+		pl = pipeline.NewBasic()
+	case "parallel-append":
+		pl = pipeline.NewParallelAppender()
+	case "async-apply":
+		pl = pipeline.NewAsyncApplier(false /* earlyAck */)
+	case "async-apply-early-ack":
+		pl = pipeline.NewAsyncApplier(true /* earlyAck */)
+	default:
+		log.Fatalf("unknown pipeline %q", *pipelineImpl)
+	}
 
 	return peer.New(cfg, s, t, pl)
 }
