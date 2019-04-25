@@ -16,7 +16,12 @@ func Enable(b bool) func() {
 	return printMetrics
 }
 
+// AppendBatchSizesHistogram records the size of Raft entry batches
+// as they are appended to the Raft log.
 var AppendBatchSizesHistogram metrics.Histogram = metrics.NilHistogram{}
+
+// ApplyBatchSizesHistogram records the size of Raft entry batches
+// as they are applied to the storage engine.
 var ApplyBatchSizesHistogram metrics.Histogram = metrics.NilHistogram{}
 
 func registerAll() {
@@ -56,5 +61,5 @@ func printMetrics() {
 			panic(fmt.Sprintf("unknown metric type %T", i))
 		}
 	}
-	fmt.Println("-------------------------------------------------\n")
+	fmt.Printf("-------------------------------------------------\n\n")
 }

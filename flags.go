@@ -49,8 +49,8 @@ func init() {
 	}
 }
 
-func cfgFromFlags() peer.PeerConfig {
-	cfg := peer.PeerConfig{ID: raftID}
+func cfgFromFlags() peer.Config {
+	cfg := peer.Config{ID: raftID}
 	if cfg.ID == 0 {
 		log.Fatalf("invalid ID (%d); must be > 0", cfg.ID)
 	}

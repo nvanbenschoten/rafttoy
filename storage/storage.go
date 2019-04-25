@@ -6,6 +6,9 @@ import (
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
+// Storage combines the responsibilities of a Raft log and a storage engine.
+// It can be implemented by the same underlying structure or by a combination
+// of two separate specialized structures.
 type Storage interface {
 	wal.Wal
 	engine.Engine

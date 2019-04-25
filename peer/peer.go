@@ -23,7 +23,7 @@ type Peer struct {
 	revSig sync.Cond // signaled to wake-up waiting proposers
 	done   int32
 
-	cfg PeerConfig
+	cfg Config
 	n   *raft.RawNode
 	s   storage.Storage
 	t   transport.Transport
@@ -34,8 +34,8 @@ type Peer struct {
 	pt proposal.Tracker
 }
 
-// PeerConfig contains configurations for constructing a Peer.
-type PeerConfig struct {
+// Config contains configurations for constructing a Peer.
+type Config struct {
 	Epoch     int32
 	ID        uint64
 	Peers     []raft.Peer
@@ -43,7 +43,7 @@ type PeerConfig struct {
 	PeerAddrs map[uint64]string
 }
 
-func makeRaftCfg(cfg PeerConfig, s storage.Storage) *raft.Config {
+func makeRaftCfg(cfg Config, s storage.Storage) *raft.Config {
 	return &raft.Config{
 		ID:                        cfg.ID,
 		ElectionTick:              3,
@@ -58,7 +58,7 @@ func makeRaftCfg(cfg PeerConfig, s storage.Storage) *raft.Config {
 
 // New creates a new Peer.
 func New(
-	cfg PeerConfig,
+	cfg Config,
 	s storage.Storage,
 	t transport.Transport,
 	pl pipeline.Pipeline,
@@ -85,6 +85,7 @@ func New(
 	return p
 }
 
+// Run starts the Peer's processing loop.
 func (p *Peer) Run() {
 	p.pl.Start()
 	go p.ticker()
@@ -115,6 +116,7 @@ func (p *Peer) ticker() {
 	}
 }
 
+// Stop stops all processing and releases all resources held by Peer.
 func (p *Peer) Stop() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -145,6 +147,7 @@ func (p *Peer) Campaign() {
 	p.sig.Signal()
 }
 
+// Propose proposes the provided update to the Raft state machine.
 func (p *Peer) Propose(prop proposal.Proposal) bool {
 	prop.ID = atomic.AddInt64(&p.pi, 1)
 	enc := proposal.Encode(prop)
