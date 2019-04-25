@@ -14,7 +14,6 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/storage/engine"
-	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/transport"
 )
 
@@ -29,20 +28,22 @@ func newPeer(epoch int32) *peer.Peer {
 
 	// Storage.
 	//  WAL.
-	w := wal.NewMem()
+	// w := wal.NewMem()
 	// w := engine.NewPebble().(wal.Wal)
 	//  Engine.
-	e := engine.NewMem()
+	// e := engine.NewMem()
 	// e := engine.NewPebble()
 	//  Combined.
-	s := storage.CombineWalAndEngine(w, e)
-	// s := engine.NewPebble().(storage.Storage)
+	// s := storage.CombineWalAndEngine(w, e)
+	s := engine.NewPebble().(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
 
 	// Pipeline.
 	pl := pipeline.NewBasic()
+	// pl := pipeline.NewAsyncApplier(false /* earlyAck */)
+	// pl := pipeline.NewAsyncApplier(true /* earlyAck */)
 
 	return peer.New(cfg, s, t, pl)
 }
@@ -59,7 +60,7 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		p.Close()
+		p.Stop()
 		printMetrics()
 		os.Exit(0)
 	}()

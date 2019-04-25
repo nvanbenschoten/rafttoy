@@ -1,7 +1,5 @@
 package proposal
 
-import "log"
-
 // Tracker tracks in-flight Raft proposals.
 type Tracker struct {
 	m map[int64]chan bool
@@ -29,8 +27,6 @@ func (pr *Tracker) Finish(id int64) {
 	if c, ok := pr.m[id]; ok {
 		delete(pr.m, id)
 		c <- true
-	} else {
-		log.Fatalf("unknown proposal %d", id)
 	}
 }
 

@@ -16,12 +16,16 @@ import (
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
-// Peer is a member of a Raft consensus group.
+// Peer is a member of a Raft consensus group. Its primary roles are to:
+// 1. route incoming Raft messages
+// 2. periodically tick the Raft RawNode
+// 3. serve as a scheduler for Raft proposal pipeline events
 type Peer struct {
 	mu     sync.RWMutex
 	sig    sync.Cond // signaled to wake-up Raft loop
 	revSig sync.Cond // signaled to wake-up waiting proposers
 	done   int32
+	wg     sync.WaitGroup
 
 	cfg Config
 	n   *raft.RawNode
@@ -78,7 +82,7 @@ func New(
 		pt:  proposal.MakeTracker(),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
-	p.pl.Init(p.cfg.Epoch, p.n, p.s, p.t, &p.pt)
+	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)
 	go p.t.Serve(p)
 	p.sig.L = &p.mu
 	p.revSig.L = p.mu.RLocker()
@@ -87,8 +91,10 @@ func New(
 
 // Run starts the Peer's processing loop.
 func (p *Peer) Run() {
+	p.wg.Add(2)
 	p.pl.Start()
 	go p.ticker()
+	defer p.wg.Done()
 
 	p.mu.Lock()
 	for {
@@ -100,11 +106,12 @@ func (p *Peer) Run() {
 			p.sig.Wait()
 		}
 		p.flushPropsLocked()
-		p.pl.RunOnce(&p.mu)
+		p.pl.RunOnce()
 	}
 }
 
 func (p *Peer) ticker() {
+	defer p.wg.Done()
 	t := time.NewTicker(200 * time.Millisecond)
 	defer t.Stop()
 	for !p.stopped() {
@@ -118,24 +125,17 @@ func (p *Peer) ticker() {
 
 // Stop stops all processing and releases all resources held by Peer.
 func (p *Peer) Stop() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	atomic.StoreInt32(&p.done, 1)
-	p.pt.FinishAll()
 	p.sig.Signal()
-	p.Close()
+	p.t.Close()
+	p.wg.Wait()
+	p.pt.FinishAll()
+	p.pl.Stop()
+	p.s.Close()
 }
 
 func (p *Peer) stopped() bool {
 	return atomic.LoadInt32(&p.done) == 1
-}
-
-// Close releases resources held by Peer. It does not acquire
-// any locks, so it can be used during an unclean shutdown.
-func (p *Peer) Close() {
-	p.s.Close()
-	p.t.Close()
-	p.pl.Stop()
 }
 
 // Campaign causes the Peer to transition to the candidate state
@@ -211,5 +211,5 @@ func (p *Peer) bumpEpochLocked(epoch int32) {
 		log.Fatal(err)
 	}
 	p.n = n
-	p.pl.Init(p.cfg.Epoch, p.n, p.s, p.t, &p.pt)
+	p.pl.BumpEpoch(epoch, n)
 }
