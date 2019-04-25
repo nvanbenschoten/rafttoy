@@ -4,6 +4,7 @@ import (
 	"log"
 	"sync"
 
+	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/transport"
@@ -55,6 +56,9 @@ func (b *basic) sendMessages(msgs []raftpb.Message) {
 }
 
 func (b *basic) saveToDisk(ents []raftpb.Entry, st raftpb.HardState, sync bool) {
+	if len(ents) > 0 {
+		metric.AppendBatchSizesHistogram.Update(int64(len(ents)))
+	}
 	if as, ok := b.s.(storage.AtomicStorage); ok {
 		as.AppendAndSetHardState(ents, st, sync)
 	} else {
@@ -74,6 +78,9 @@ func (b *basic) processSnapshot(sn raftpb.Snapshot) {
 }
 
 func (b *basic) applyToStore(l sync.Locker, ents []raftpb.Entry) {
+	if len(ents) > 0 {
+		metric.ApplyBatchSizesHistogram.Update(int64(len(ents)))
+	}
 	for _, e := range ents {
 		switch e.Type {
 		case raftpb.EntryNormal:

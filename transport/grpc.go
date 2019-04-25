@@ -158,7 +158,8 @@ func (g *grpc) Close() {
 	g.dialCancel()
 	g.clientMu.Lock()
 	defer g.clientMu.Unlock()
-	for _, c := range g.clientBufs {
+	for id, c := range g.clientBufs {
 		close(c)
+		delete(g.clientBufs, id)
 	}
 }

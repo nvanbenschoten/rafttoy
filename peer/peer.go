@@ -2,6 +2,7 @@ package peer
 
 import (
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,13 +16,12 @@ import (
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
+// Peer is a member of a Raft consensus group.
 type Peer struct {
 	mu     sync.RWMutex
-	sig    sync.Cond
-	sigAt  int32
-	revSig sync.Cond
+	sig    sync.Cond // signaled to wake-up Raft loop
+	revSig sync.Cond // signaled to wake-up waiting proposers
 	done   int32
-	epoch  int32
 
 	cfg PeerConfig
 	n   *raft.RawNode
@@ -34,7 +34,9 @@ type Peer struct {
 	pt proposal.Tracker
 }
 
+// PeerConfig contains configurations for constructing a Peer.
 type PeerConfig struct {
+	Epoch     int32
 	ID        uint64
 	Peers     []raft.Peer
 	SelfAddr  string
@@ -46,8 +48,8 @@ func makeRaftCfg(cfg PeerConfig, s storage.Storage) *raft.Config {
 		ID:                        cfg.ID,
 		ElectionTick:              3,
 		HeartbeatTick:             1,
-		MaxSizePerMsg:             1 << 16,
-		MaxInflightMsgs:           512,
+		MaxSizePerMsg:             math.MaxUint64,
+		MaxInflightMsgs:           int(math.MaxInt64),
 		Storage:                   util.NewRaftStorage(s),
 		PreVote:                   true,
 		DisableProposalForwarding: true,
@@ -56,7 +58,6 @@ func makeRaftCfg(cfg PeerConfig, s storage.Storage) *raft.Config {
 
 // New creates a new Peer.
 func New(
-	epoch int32,
 	cfg PeerConfig,
 	s storage.Storage,
 	t transport.Transport,
@@ -69,16 +70,15 @@ func New(
 	}
 
 	p := &Peer{
-		epoch: epoch,
-		cfg:   cfg,
-		n:     n,
-		s:     s,
-		t:     t,
-		pl:    pl,
-		pt:    proposal.MakeTracker(),
+		cfg: cfg,
+		n:   n,
+		s:   s,
+		t:   t,
+		pl:  pl,
+		pt:  proposal.MakeTracker(),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
-	p.pl.Init(p.epoch, p.n, p.s, p.t, &p.pt)
+	p.pl.Init(p.cfg.Epoch, p.n, p.s, p.t, &p.pt)
 	go p.t.Serve(p)
 	p.sig.L = &p.mu
 	p.revSig.L = p.mu.RLocker()
@@ -90,10 +90,10 @@ func (p *Peer) Run() {
 	go p.ticker()
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	for {
 		for p.pb.lenWLocked() == 0 && !p.n.HasReady() {
 			if p.stopped() {
+				p.mu.Unlock()
 				return
 			}
 			p.sig.Wait()
@@ -183,10 +183,10 @@ func (p *Peer) flushPropsLocked() {
 func (p *Peer) HandleMessage(epoch int32, msg *raftpb.Message) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if epoch < p.epoch {
+	if epoch < p.cfg.Epoch {
 		return
 	}
-	if epoch > p.epoch {
+	if epoch > p.cfg.Epoch {
 		log.Printf("bumping test epoch to %d", epoch)
 		p.bumpEpochLocked(epoch)
 	}
@@ -199,7 +199,7 @@ func (p *Peer) bumpEpochLocked(epoch int32) {
 		log.Fatal("cannot reset peer with in-flight proposals")
 	}
 	// Clear all persistent state and create a new Raft node.
-	p.epoch = epoch
+	p.cfg.Epoch = epoch
 	p.s.Truncate()
 	p.s.Clear()
 	raftCfg := makeRaftCfg(p.cfg, p.s)
@@ -208,5 +208,5 @@ func (p *Peer) bumpEpochLocked(epoch int32) {
 		log.Fatal(err)
 	}
 	p.n = n
-	p.pl.Init(p.epoch, p.n, p.s, p.t, &p.pt)
+	p.pl.Init(p.cfg.Epoch, p.n, p.s, p.t, &p.pt)
 }

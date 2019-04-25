@@ -2,13 +2,13 @@ package main
 
 import (
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/peer"
 	"github.com/nvanbenschoten/raft-toy/pipeline"
 	"github.com/nvanbenschoten/raft-toy/proposal"
@@ -18,12 +18,14 @@ import (
 	"github.com/nvanbenschoten/raft-toy/transport"
 )
 
-func init() {
-	rand.Seed(time.Now().UTC().UnixNano())
-}
-
 func newPeer(epoch int32) *peer.Peer {
-	cfg := parseFlags()
+	cfg := cfgFromFlags()
+	cfg.Epoch = epoch
+
+	//    CONFIGURE PLUGGABLE COMPONENTS HERE:
+	// It would be nice to inject these directly from
+	// the benchmarks, but that doesn't work well when
+	// coordinating across processes. This is easiest.
 
 	// Storage.
 	//  WAL.
@@ -42,10 +44,13 @@ func newPeer(epoch int32) *peer.Peer {
 	// Pipeline.
 	pl := pipeline.NewBasic()
 
-	return peer.New(epoch, cfg, s, t, pl)
+	return peer.New(cfg, s, t, pl)
 }
 
 func main() {
+	printMetrics := metric.Enable(recordMetrics)
+	defer printMetrics()
+
 	p := newPeer(0)
 
 	// Make sure we clean up before exiting.
@@ -54,6 +59,7 @@ func main() {
 	go func() {
 		<-c
 		p.Close()
+		printMetrics()
 		os.Exit(0)
 	}()
 

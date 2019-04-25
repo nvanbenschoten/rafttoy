@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"golang.org/x/sync/errgroup"
 )
@@ -20,8 +21,13 @@ func newEpoch() int32 {
 	return e
 }
 
+func TestMain(m *testing.M) {
+	defer metric.Enable(recordMetrics)()
+	m.Run()
+}
+
 func BenchmarkRaft(b *testing.B) {
-	runFor(b, "conc", 1, 1, 10, func(b *testing.B, conc int) {
+	runFor(b, "conc", 1, 1, 12, func(b *testing.B, conc int) {
 		runFor(b, "bytes", 1, 4, 4, func(b *testing.B, bytes int) {
 			benchmarkRaft(b, conc, bytes)
 		})
