@@ -1,5 +1,6 @@
-GO  ?= go
-MOD := -mod=vendor
+GO   ?= go
+MOD  := -mod=vendor
+PKGS := $$($(GO) list ./... | grep -v /vendor/)
 
 .PHONY: build
 build:
@@ -13,6 +14,11 @@ test:
 .PHONY: bench
 bench:
 	@$(GO) test $(MOD) -v -run=XXX -bench=. ./...
+
+.PHONY: lint
+lint:
+	golint $(PKGS)
+	$(GO) vet $(PKGS)
 
 .PHONY: vendor
 vendor:
