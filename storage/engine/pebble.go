@@ -200,9 +200,6 @@ func appendEntsToBatch(b *pdb.Batch, ents []raftpb.Entry) {
 
 func (p *pebble) Entries(lo, hi uint64) []raftpb.Entry {
 	n := hi - lo
-	if n > 100 {
-		n = 100
-	}
 	ents := make([]raftpb.Entry, 0, n)
 	ents, hitIndex := p.c.Entries(ents, lo, hi)
 	if uint64(len(ents)) == hi-lo {

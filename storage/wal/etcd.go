@@ -50,9 +50,6 @@ func (w *etcdWal) Append(ents []raftpb.Entry) {
 
 func (w *etcdWal) Entries(lo, hi uint64) []raftpb.Entry {
 	n := hi - lo
-	if n > 100 {
-		n = 100
-	}
 	ents := make([]raftpb.Entry, 0, n)
 	ents, _ = w.c.Entries(ents, lo, hi)
 	if uint64(len(ents)) != hi-lo {
