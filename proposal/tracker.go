@@ -23,17 +23,17 @@ func (pr *Tracker) Register(enc EncProposal, c chan bool) {
 }
 
 // Finish informs a tracked proposal that it has completed.
-func (pr *Tracker) Finish(id int64) {
+func (pr *Tracker) Finish(id int64, success bool) {
 	if c, ok := pr.m[id]; ok {
 		delete(pr.m, id)
-		c <- true
+		c <- success
 	}
 }
 
 // FinishAll informs all tracked proposal that they have completed.
 func (pr *Tracker) FinishAll() {
 	for id, c := range pr.m {
-		c <- true
+		c <- false
 		delete(pr.m, id)
 	}
 }

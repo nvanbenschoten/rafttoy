@@ -71,7 +71,7 @@ func (pl *asyncApplier) ackCommittedEnts(ents []raftpb.Entry) {
 				continue
 			}
 			ec := proposal.EncProposal(e.Data)
-			pl.pt.Finish(ec.GetID())
+			pl.pt.Finish(ec.GetID(), true)
 		case raftpb.EntryConfChange:
 		default:
 			panic("unexpected")
@@ -127,7 +127,7 @@ func (pl *asyncApplier) Start() {
 					if !pl.earlyAck {
 						ec := proposal.EncProposal(e.Data)
 						pl.l.Lock()
-						pl.pt.Finish(ec.GetID())
+						pl.pt.Finish(ec.GetID(), true)
 						pl.l.Unlock()
 					}
 				case raftpb.EntryConfChange:

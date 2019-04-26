@@ -119,7 +119,7 @@ func applyToStore(
 						continue
 					}
 					ec := proposal.EncProposal(ent.Data)
-					pt.Finish(ec.GetID())
+					pt.Finish(ec.GetID(), true)
 				case raftpb.EntryConfChange:
 				default:
 					panic("unexpected")
@@ -140,7 +140,7 @@ func applyToStore(
 				if ack {
 					ec := proposal.EncProposal(ent.Data)
 					l.Lock()
-					pt.Finish(ec.GetID())
+					pt.Finish(ec.GetID(), true)
 					l.Unlock()
 				}
 			case raftpb.EntryConfChange:

@@ -14,6 +14,7 @@ import (
 	transpb "github.com/nvanbenschoten/raft-toy/transport/transportpb"
 	"github.com/nvanbenschoten/raft-toy/util"
 	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/raftpb"
 )
 
 // Peer is a member of a Raft consensus group. Its primary roles are to:
@@ -37,7 +38,7 @@ type Peer struct {
 	pt proposal.Tracker
 
 	msgs            chan *transpb.RaftMsg
-	flushPropElemFn func(propBufElem)
+	flushPropsFn func([]propBufElem)
 }
 
 // Config contains configurations for constructing a Peer.
@@ -88,7 +89,7 @@ func New(
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
 	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)
 	p.pb.init()
-	p.flushPropElemFn = p.flushPropElem
+	p.flushPropsFn = p.flushProps
 	go p.t.Serve(p)
 	return p
 }
@@ -104,13 +105,13 @@ func (p *Peer) Run() {
 		<-p.sig
 		if p.stopped() {
 			p.mu.Lock()
-			p.pb.flush(p.flushPropElemFn)
+			p.pb.flush(p.flushPropsFn)
 			p.mu.Unlock()
 			return
 		}
 		p.mu.Lock()
-		p.pb.flush(p.flushPropElemFn)
 		p.flushMsgs()
+		p.pb.flush(p.flushPropsFn)
 		p.pl.RunOnce()
 		p.mu.Unlock()
 	}
@@ -181,12 +182,20 @@ func (p *Peer) ProposeWith(enc proposal.EncProposal, c chan bool) bool {
 	return <-c
 }
 
-func (p *Peer) flushPropElem(e propBufElem) {
-	err := p.n.Propose(e.enc)
-	if err != nil {
-		e.c <- false
-	} else {
-		p.pt.Register(e.enc, e.c)
+func (p *Peer) flushProps(es []propBufElem) {
+	ents := make([]raftpb.Entry, len(es))
+	for i := range es {
+		ents[i].Data = es[i].enc
+		p.pt.Register(es[i].enc, es[i].c)
+	}
+	if err := p.n.Step(raftpb.Message{
+		Type: raftpb.MsgProp,
+		From: p.cfg.ID,
+		Entries: ents,
+	}); err != nil {
+		for i := range es {
+			p.pt.Finish(es[i].enc.GetID(), false)
+		}
 	}
 }
 

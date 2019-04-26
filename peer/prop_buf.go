@@ -7,7 +7,7 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 )
 
-const propBufCap = 256
+const propBufCap = 1024
 
 type propBuf struct {
 	mu   sync.RWMutex
@@ -39,7 +39,7 @@ func (b *propBuf) add(e propBufElem) {
 	}
 }
 
-func (b *propBuf) flush(f func(propBufElem)) {
+func (b *propBuf) flush(f func([]propBufElem)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	i := int(b.i)
@@ -47,8 +47,8 @@ func (b *propBuf) flush(f func(propBufElem)) {
 		i = len(b.b)
 		b.full.Broadcast()
 	}
-	for _, e := range b.b[:i] {
-		f(e)
+	if i > 0 {
+		f(b.b[:i])
+		b.i = 0
 	}
-	b.i = 0
 }
