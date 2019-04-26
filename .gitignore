@@ -5,6 +5,8 @@
 *.so
 *.dylib
 raft-toy
+raft-toy-leader
+raft-toy-follower
 
 # Test binary, build with `go test -c`
 *.test
