@@ -33,11 +33,12 @@ func init() {
 			if err != nil {
 				panic(err)
 			}
-			flag.Bool(f.Name, def, f.Usage)
+			_ = flag.Bool(f.Name, def, f.Usage)
 		default:
-			flag.String(f.Name, f.DefValue, f.Usage)
+			_ = flag.String(f.Name, f.DefValue, f.Usage)
 		}
 	})
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
 	util.SetRaftLoggingVerbosity(*verbose)
 }
