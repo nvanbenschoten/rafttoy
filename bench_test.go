@@ -3,10 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"testing"
 
 	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/proposal"
+	"github.com/nvanbenschoten/raft-toy/storage/engine"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -28,7 +30,7 @@ func TestMain(m *testing.M) {
 
 func BenchmarkRaft(b *testing.B) {
 	runFor(b, "conc", 1, 1, 12, func(b *testing.B, conc int) {
-		runFor(b, "bytes", 1, 4, 4, func(b *testing.B, bytes int) {
+		runFor(b, "bytes", 1, 2, 8, func(b *testing.B, bytes int) {
 			benchmarkRaft(b, conc, bytes)
 		})
 	})
@@ -43,19 +45,25 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 	becomeLeader(p)
 
 	// Create a single instance of a Raft proposal.
-	prop := proposal.Proposal{
-		Key: []byte("key"),
-		Val: make([]byte, bytes),
-	}
+	propBytes := make([]byte, bytes)
+	rand.Read(propBytes[:])
 
 	b.ResetTimer()
 	b.SetBytes(int64(bytes))
 	var g errgroup.Group
 	defer g.Wait()
 	for i := 0; i < conc; i++ {
+		rng := rand.New(rand.NewSource(int64(i)))
 		g.Go(func() error {
+			keyPrefix := engine.MinDataKey
+			prop := proposal.Proposal{
+				Key: append(keyPrefix, make([]byte, 8)...),
+				Val: propBytes,
+			}
+
 			iters := b.N / conc
 			for j := 0; j < iters; j++ {
+				rng.Read(prop.Key[len(keyPrefix):])
 				if !p.Propose(prop) {
 					return errors.New("proposal failed")
 				}

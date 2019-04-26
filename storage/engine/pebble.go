@@ -21,7 +21,9 @@ const dirPrefix = "pebble-data"
 
 var minMetaKey = []byte{0x00}
 var maxMetaKey = []byte{0x01}
-var minDataKey = maxMetaKey
+
+// MinDataKey is the minimum key allowable data key.
+var MinDataKey = maxMetaKey
 var maxDataKey = []byte{0x02}
 var minLogKey = maxDataKey
 var maxLogKey = []byte{0x03}
