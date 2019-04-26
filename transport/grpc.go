@@ -24,6 +24,7 @@ type grpc struct {
 	dialCancel func()
 	clientMu   sync.Mutex
 	clientBufs map[uint64]chan<- *transpb.RaftMsg
+	sortBuf byDestination
 }
 
 // NewGRPC creates a new Transport that uses gRPC streams.
@@ -83,9 +84,7 @@ func (g *grpc) RaftMessage(stream transpb.RaftService_RaftMessageServer) error {
 
 func (g *grpc) Send(epoch int32, msgs []raftpb.Message) {
 	// Group messages by destination and combine.
-	sort.Slice(msgs, func(i, j int) bool {
-		return msgs[i].To < msgs[j].To
-	})
+	g.sortMsgs(msgs)
 	st := 0
 	to := msgs[0].To
 	for i := 1; i < len(msgs); i++ {
@@ -103,6 +102,18 @@ func (g *grpc) Send(epoch int32, msgs []raftpb.Message) {
 		Msgs:  msgs[st:],
 	})
 }
+
+func (g *grpc) sortMsgs(msgs []raftpb.Message) {
+	g.sortBuf = msgs
+	sort.Sort(&g.sortBuf)
+}
+
+// byDestination implements sort.Interface.
+type byDestination []raftpb.Message
+
+func (s byDestination) Len() int           { return len(s) }
+func (s byDestination) Less(i, j int) bool { return s[i].To < s[j].To }
+func (s byDestination) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {
 	g.clientMu.Lock()
