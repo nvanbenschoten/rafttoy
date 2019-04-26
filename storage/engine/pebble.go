@@ -52,7 +52,7 @@ func NewPebble(root string, disableWAL bool) Engine {
 		db:   db,
 		opts: opts,
 		dir:  dir,
-		c:    wal.MakeLogCache(true),
+		c:    wal.MakeLogCache(false),
 	}
 }
 

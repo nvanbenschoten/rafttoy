@@ -122,7 +122,9 @@ func (g *grpc) sendAsync(to uint64, m *transpb.RaftMsg) {
 	if !ok {
 		log.Fatalf("unknown peer %d", to)
 	}
-	conn, err := rpc.DialContext(g.dialCtx, url, rpc.WithInsecure(), rpc.WithBlock())
+	conn, err := rpc.DialContext(g.dialCtx, url,
+		rpc.WithInsecure(), rpc.WithBlock(), rpc.WithInitialWindowSize(1<<20),
+	)
 	if err != nil {
 		switch err {
 		case context.Canceled:

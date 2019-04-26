@@ -14,7 +14,6 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/storage/engine"
-	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/transport"
 )
 
@@ -31,13 +30,13 @@ func newPeer(epoch int32) *peer.Peer {
 	//  WAL.
 	// w := wal.NewMem()
 	// w := engine.NewPebble(*dataDir, false).(wal.Wal)
-	w := wal.NewEtcdWal(*dataDir)
+	// w := wal.NewEtcdWal(*dataDir)
 	//  Engine.
 	// e := engine.NewMem()
-	e := engine.NewPebble(*dataDir, false)
+	// e := engine.NewPebble(*dataDir, false)
 	//  Combined.
-	s := storage.CombineWalAndEngine(w, e)
-	// s := engine.NewPebble(*dataDir, false).(storage.Storage)
+	// s := storage.CombineWalAndEngine(w, e)
+	s := engine.NewPebble(*dataDir, false).(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
@@ -50,9 +49,11 @@ func newPeer(epoch int32) *peer.Peer {
 	case "parallel-append":
 		pl = pipeline.NewParallelAppender()
 	case "async-apply":
-		pl = pipeline.NewAsyncApplier(false /* earlyAck */)
+		pl = pipeline.NewAsyncApplier(false /* earlyAck */, false /* lazyFollower */)
 	case "async-apply-early-ack":
-		pl = pipeline.NewAsyncApplier(true /* earlyAck */)
+		pl = pipeline.NewAsyncApplier(true /* earlyAck */, false /* lazyFollower */)
+	case "async-apply-early-ack-lazy-follower":
+		pl = pipeline.NewAsyncApplier(true /* earlyAck */, true /* lazyFollower */)
 	default:
 		log.Fatalf("unknown pipeline %q", *pipelineImpl)
 	}

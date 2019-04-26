@@ -3,6 +3,7 @@ package pipeline
 import (
 	"github.com/nvanbenschoten/raft-toy/metric"
 	"github.com/nvanbenschoten/raft-toy/proposal"
+	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 
@@ -11,13 +12,21 @@ import (
 // allows it to have a tighter loop around appending log entries
 // and sending Raft messages.
 //
-// The pipeline has an option to acknowledge committed entries
-// immediately after learning that they were committed instead
-// of waiting until after they have also been applied.
+// The earlyAck option instructs the pipeline to acknowledge
+// committed entries immediately after learning that they were
+// committed instead of waiting until after they have also been
+// applied.
+//
+// The lazyFollower option instructs the pipeline to forego entry
+// application of Raft followers entirely. This is not quite a
+// proposed optimization, but it simulates delayed and/or heavily
+// batched entry application on followers, which is.
 type asyncApplier struct {
 	basic
-	earlyAck bool
-	toApply  chan asyncEvent
+	earlyAck     bool
+	lazyFollower bool
+	leader       bool
+	toApply      chan asyncEvent
 }
 
 type asyncEvent struct {
@@ -27,7 +36,7 @@ type asyncEvent struct {
 }
 
 // NewAsyncApplier creates a new "async applier" pipeline.
-func NewAsyncApplier(earlyAck bool) Pipeline {
+func NewAsyncApplier(earlyAck, lazyFollower bool) Pipeline {
 	return &asyncApplier{
 		earlyAck: earlyAck,
 		toApply:  make(chan asyncEvent, 512),
@@ -37,6 +46,9 @@ func NewAsyncApplier(earlyAck bool) Pipeline {
 func (pl *asyncApplier) RunOnce() {
 	defer measurePipelineLat()()
 	rd := pl.n.Ready()
+	if rd.SoftState != nil {
+		pl.leader = rd.SoftState.RaftState == raft.StateLeader
+	}
 	if pl.earlyAck {
 		pl.ackCommittedEnts(rd.CommittedEntries)
 	}
@@ -84,6 +96,8 @@ func (pl *asyncApplier) maybeApplyAsync(ents []raftpb.Entry) {
 		pl.toApply <- asyncEvent{sync: syncC}
 		<-syncC
 		applyToStore(pl.n, pl.s, pl.pt, pl.l, ents, !pl.earlyAck)
+	} else if pl.lazyFollower && !pl.leader {
+		// Do nothing.
 	} else {
 		// Send to async applier.
 		pl.toApply <- asyncEvent{ents: ents}
