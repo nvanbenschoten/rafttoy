@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 }
 
 func BenchmarkRaft(b *testing.B) {
-	runFor(b, "conc", 1, 1, 12, func(b *testing.B, conc int) {
+	runFor(b, "conc", 1, 1, 15, func(b *testing.B, conc int) {
 		runFor(b, "bytes", 1, 2, 8, func(b *testing.B, bytes int) {
 			benchmarkRaft(b, conc, bytes)
 		})
