@@ -3,14 +3,13 @@ package engine
 import (
 	"bytes"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 
 	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/util/raftentry"
+	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	pdb "github.com/petermattis/pebble"
 	"github.com/petermattis/pebble/db"
 	"go.etcd.io/etcd/raft"
@@ -33,7 +32,7 @@ type pebble struct {
 	db   *pdb.DB
 	opts *db.Options
 	dir  string
-	c    logCache
+	c    wal.LogCache
 }
 
 // NewPebble creates an LSM-based storage engine using Pebble.
@@ -53,7 +52,7 @@ func NewPebble(root string, disableWAL bool) Engine {
 		db:   db,
 		opts: opts,
 		dir:  dir,
-		c:    makeLogCache(),
+		c:    wal.MakeLogCache(true),
 	}
 }
 
@@ -61,12 +60,12 @@ func randDir(root string) string {
 	return filepath.Join(root, dirPrefix, strconv.FormatUint(rand.Uint64(), 10))
 }
 
-func (p *pebble) SetHardState(st raftpb.HardState) {
+func (p *pebble) SetHardState(st raftpb.HardState, sync bool) {
 	buf, err := st.Marshal()
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := p.db.Set(hardStateKey, buf, db.Sync); err != nil {
+	if err := p.db.Set(hardStateKey, buf, optsForSync(sync)); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -101,7 +100,7 @@ func (p *pebble) ApplyEntries(ents []raftpb.Entry) {
 }
 
 func (p *pebble) Clear() {
-	p.Close()
+	p.CloseWal()
 	db, err := pdb.Open(p.dir, p.opts)
 	if err != nil {
 		log.Fatal(err)
@@ -109,7 +108,7 @@ func (p *pebble) Clear() {
 	p.db = db
 }
 
-func (p *pebble) Close() {
+func (p *pebble) CloseEngine() {
 	if err := p.db.Close(); err != nil {
 		log.Fatal(err)
 	}
@@ -163,31 +162,6 @@ func decodeRaftLogKey(k []byte) uint64 {
 	return v
 }
 
-const cacheSizeTarget = 2048
-
-// logCache remembers a few facts about the Raft log.
-type logCache struct {
-	lastIndex  uint64
-	lastTerm   uint64
-	truncIndex uint64
-	ec         *raftentry.Cache
-}
-
-func makeLogCache() logCache {
-	return logCache{lastIndex: 0, ec: raftentry.NewCache(4 << 20)}
-}
-
-func (c *logCache) updateForEnts(ents []raftpb.Entry) {
-	last := ents[len(ents)-1]
-	c.lastIndex = last.Index
-	c.lastTerm = last.Term
-	c.ec.Add(0, ents, true)
-	if last.Index >= c.truncIndex+2*cacheSizeTarget {
-		c.truncIndex = last.Index - cacheSizeTarget
-		c.ec.Clear(0, c.truncIndex)
-	}
-}
-
 func (p *pebble) Append(ents []raftpb.Entry) {
 	if len(ents) == 0 {
 		return
@@ -198,7 +172,7 @@ func (p *pebble) Append(ents []raftpb.Entry) {
 	if err := b.Commit(db.Sync); err != nil {
 		log.Fatal(err)
 	}
-	p.c.updateForEnts(ents)
+	p.c.UpdateOnAppend(ents)
 }
 
 func appendEntsToBatch(b *pdb.Batch, ents []raftpb.Entry) {
@@ -230,7 +204,7 @@ func (p *pebble) Entries(lo, hi uint64) []raftpb.Entry {
 		n = 100
 	}
 	ents := make([]raftpb.Entry, 0, n)
-	ents, _, hitIndex, _ := p.c.ec.Scan(ents, 0, lo, hi, math.MaxUint64)
+	ents, hitIndex := p.c.Entries(ents, lo, hi)
 	if uint64(len(ents)) == hi-lo {
 		return ents
 	}
@@ -253,11 +227,8 @@ func (p *pebble) Entries(lo, hi uint64) []raftpb.Entry {
 }
 
 func (p *pebble) Term(i uint64) uint64 {
-	if p.c.lastIndex == i && p.c.lastTerm != 0 {
-		return p.c.lastTerm
-	}
-	if e, ok := p.c.ec.Get(0, i); ok {
-		return e.Term
+	if t, ok := p.c.Term(i); ok {
+		return t
 	}
 
 	var kArr [maxLogKeyLen]byte
@@ -279,16 +250,20 @@ func (p *pebble) Term(i uint64) uint64 {
 }
 
 func (p *pebble) LastIndex() uint64 {
-	return p.c.lastIndex
+	return p.c.LastIndex()
 }
 
 func (p *pebble) FirstIndex() uint64 {
-	return 1
+	return p.c.FirstIndex()
 }
 
 func (p *pebble) Truncate() {
 	p.Clear()
-	p.c = makeLogCache()
+	p.c.Reset()
+}
+
+func (p *pebble) CloseWal() {
+	p.CloseEngine()
 }
 
 //////////////////////////////////////////////////////
@@ -304,7 +279,7 @@ func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState,
 	defer b.Close()
 	if len(ents) > 0 {
 		appendEntsToBatch(b, ents)
-		p.c.updateForEnts(ents)
+		p.c.UpdateOnAppend(ents)
 	}
 	if !raft.IsEmptyHardState(st) {
 		buf, err := st.Marshal()
@@ -315,11 +290,14 @@ func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState,
 			log.Fatal(err)
 		}
 	}
-	opts := db.NoSync
-	if sync {
-		opts = db.Sync
-	}
-	if err := b.Commit(opts); err != nil {
+	if err := b.Commit(optsForSync(sync)); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func optsForSync(sync bool) *db.WriteOptions {
+	if sync {
+		return db.Sync
+	}
+	return db.NoSync
 }

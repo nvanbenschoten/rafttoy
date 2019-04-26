@@ -21,7 +21,7 @@ func NewMem() Engine {
 	}
 }
 
-func (m *mem) SetHardState(st raftpb.HardState) {
+func (m *mem) SetHardState(st raftpb.HardState, _ bool) {
 	if err := m.m.SetHardState(st); err != nil {
 		log.Fatal(err)
 	}
@@ -37,6 +37,6 @@ func (m *mem) Clear() {
 	m.kv = make(map[string][]byte)
 }
 
-func (m *mem) Close() {
+func (m *mem) CloseEngine() {
 	// No-op.
 }

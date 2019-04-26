@@ -145,7 +145,8 @@ func (p *Peer) Stop() {
 	p.wg.Wait()
 	p.pt.FinishAll()
 	p.pl.Stop()
-	p.s.Close()
+	p.s.CloseEngine()
+	p.s.CloseWal()
 }
 
 func (p *Peer) stopped() bool {
@@ -227,4 +228,25 @@ func (p *Peer) bumpEpoch(epoch int32) {
 	}
 	p.n = n
 	p.pl.Resume(epoch, n)
+}
+
+// WaitForAllCaughtUp waits for all peers to catch up to the same log index.
+func (p *Peer) WaitForAllCaughtUp() {
+	for {
+		p.mu.Lock()
+		var match uint64
+		caughtUp := true
+		p.n.WithProgress(func(id uint64, _ raft.ProgressType, pr raft.Progress) {
+			if match == 0 {
+				match = pr.Match
+			} else {
+				caughtUp = caughtUp && match == pr.Match
+			}
+		})
+		p.mu.Unlock()
+		if caughtUp {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

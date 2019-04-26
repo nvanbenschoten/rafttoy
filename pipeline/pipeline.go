@@ -48,7 +48,9 @@ func saveToDisk(s storage.Storage, ents []raftpb.Entry, st raftpb.HardState, syn
 			s.Append(ents)
 		}
 		if !raft.IsEmptyHardState(st) {
-			s.SetHardState(st)
+			// This isn't exactly correct, but it's close enough.
+			syncHS := sync && len(ents) == 0
+			s.SetHardState(st, syncHS)
 		}
 	}
 }

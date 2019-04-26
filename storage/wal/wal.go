@@ -10,4 +10,5 @@ type Wal interface {
 	Term(i uint64) uint64
 	LastIndex() uint64
 	FirstIndex() uint64
+	CloseWal()
 }

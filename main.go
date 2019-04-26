@@ -14,6 +14,7 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 	"github.com/nvanbenschoten/raft-toy/storage"
 	"github.com/nvanbenschoten/raft-toy/storage/engine"
+	"github.com/nvanbenschoten/raft-toy/storage/wal"
 	"github.com/nvanbenschoten/raft-toy/transport"
 )
 
@@ -30,12 +31,13 @@ func newPeer(epoch int32) *peer.Peer {
 	//  WAL.
 	// w := wal.NewMem()
 	// w := engine.NewPebble(*dataDir, false).(wal.Wal)
+	w := wal.NewEtcdWal(*dataDir)
 	//  Engine.
 	// e := engine.NewMem()
-	// e := engine.NewPebble(*dataDir, true)
+	e := engine.NewPebble(*dataDir, false)
 	//  Combined.
-	// s := storage.CombineWalAndEngine(w, e)
-	s := engine.NewPebble(*dataDir, false).(storage.Storage)
+	s := storage.CombineWalAndEngine(w, e)
+	// s := engine.NewPebble(*dataDir, false).(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
@@ -122,4 +124,5 @@ func becomeLeader(p *peer.Peer) {
 		}
 		time.Sleep(1 * time.Millisecond)
 	}
+	p.WaitForAllCaughtUp()
 }

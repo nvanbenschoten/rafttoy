@@ -7,7 +7,7 @@ import (
 	"github.com/nvanbenschoten/raft-toy/proposal"
 )
 
-const propBufCap = 64
+const propBufCap = 256
 
 type propBuf struct {
 	mu   sync.RWMutex

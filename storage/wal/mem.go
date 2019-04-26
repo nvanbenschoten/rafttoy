@@ -59,3 +59,7 @@ func (m *mem) FirstIndex() uint64 {
 func (m *mem) Truncate() {
 	m.m = raft.NewMemoryStorage()
 }
+
+func (m *mem) CloseWal() {
+	// No-op.
+}

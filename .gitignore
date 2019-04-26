@@ -14,3 +14,4 @@ raft-toy
 
 # Test data
 pebble-data
+etcd-wal
