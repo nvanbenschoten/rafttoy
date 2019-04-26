@@ -29,24 +29,38 @@ func (enc EncProposal) GetID() int64 {
 	return getInt64(enc[:8])
 }
 
-// Encode maps a Proposal to an EncProposal.
-func Encode(p Proposal) EncProposal {
-	enc := make([]byte, 3*8+len(p.Key)+len(p.Val))
+// Size returns the size that the Proposal will be when encoded.
+func Size(p Proposal) int {
+	return 3*8+len(p.Key)+len(p.Val)
+}
+
+// EncodeInto maps a Proposal to an EncProposal
+// in an existing byte slice.
+func EncodeInto(p Proposal, b []byte) EncProposal {
+	if len(b) != Size(p) {
+		panic("size mismatch")
+	}
 	n := 0
-	putInt64(enc[n:n+8], p.ID)
+	putInt64(b[n:n+8], p.ID)
 	n += 8
-	putInt64(enc[n:n+8], int64(len(p.Key)))
+	putInt64(b[n:n+8], int64(len(p.Key)))
 	n += 8
-	copy(enc[n:n+len(p.Key)], p.Key)
+	copy(b[n:n+len(p.Key)], p.Key)
 	n += len(p.Key)
-	putInt64(enc[n:n+8], int64(len(p.Val)))
+	putInt64(b[n:n+8], int64(len(p.Val)))
 	n += 8
-	copy(enc[n:n+len(p.Val)], p.Val)
+	copy(b[n:n+len(p.Val)], p.Val)
 	n += len(p.Val)
-	if n != len(enc) {
+	if n != len(b) {
 		panic("accounting error")
 	}
-	return enc
+	return b
+}
+
+// Encode maps a Proposal to an EncProposal.
+func Encode(p Proposal) EncProposal {
+	b := make([]byte, Size(p))
+	return EncodeInto(p, b)
 }
 
 // Decode maps an EncProposal to a Proposal.

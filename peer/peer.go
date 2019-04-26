@@ -164,9 +164,13 @@ func (p *Peer) Campaign() {
 
 // Propose proposes the provided update to the Raft state machine.
 func (p *Peer) Propose(prop proposal.Proposal) bool {
-	prop.ID = atomic.AddInt64(&p.pi, 1)
-	enc := proposal.Encode(prop)
-	c := make(chan bool, 1)
+	return p.ProposeWith(proposal.Encode(prop), make(chan bool, 1))
+}
+
+// ProposeWith proposes the provided encoded update to the Raft
+// state machine. Channel c is expected to have a capacity of 1.
+func (p *Peer) ProposeWith(enc proposal.EncProposal, c chan bool) bool {
+	enc.SetID(atomic.AddInt64(&p.pi, 1))
 	el := propBufElem{enc, c}
 
 	p.pb.add(el)

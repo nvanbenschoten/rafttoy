@@ -60,11 +60,14 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 				Key: append(keyPrefix, make([]byte, 8)...),
 				Val: propBytes,
 			}
+			encBuf := make([]byte, proposal.Size(prop))
+			c := make(chan bool, 1)
 
 			iters := b.N / conc
 			for j := 0; j < iters; j++ {
 				rng.Read(prop.Key[len(keyPrefix):])
-				if !p.Propose(prop) {
+				enc := proposal.EncodeInto(prop, encBuf)
+				if !p.ProposeWith(enc, c) {
 					return errors.New("proposal failed")
 				}
 			}
