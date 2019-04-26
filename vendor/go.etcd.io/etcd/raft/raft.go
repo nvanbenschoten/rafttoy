@@ -607,14 +607,14 @@ func (r *raft) maybeCommit() bool {
 	if cap(r.matchBuf) < len(r.prs) {
 		r.matchBuf = make(uint64Slice, len(r.prs))
 	}
-	mis := r.matchBuf[:len(r.prs)]
+	r.matchBuf = r.matchBuf[:len(r.prs)]
 	idx := 0
 	for _, p := range r.prs {
-		mis[idx] = p.Match
+		r.matchBuf[idx] = p.Match
 		idx++
 	}
-	sort.Sort(mis)
-	mci := mis[len(mis)-r.quorum()]
+	sort.Sort(&r.matchBuf)
+	mci := r.matchBuf[len(r.matchBuf)-r.quorum()]
 	return r.raftLog.maybeCommit(mci, r.Term)
 }
 
@@ -1005,11 +1005,12 @@ func stepLeader(r *raft, m pb.Message) error {
 			return ErrProposalDropped
 		}
 
-		for i, e := range m.Entries {
+		for i := range m.Entries {
+			e := &m.Entries[i]
 			if e.Type == pb.EntryConfChange {
 				if r.pendingConfIndex > r.raftLog.applied {
 					r.logger.Infof("propose conf %s ignored since pending unapplied configuration [index %d, applied %d]",
-						e.String(), r.pendingConfIndex, r.raftLog.applied)
+						e, r.pendingConfIndex, r.raftLog.applied)
 					m.Entries[i] = pb.Entry{Type: pb.EntryNormal}
 				} else {
 					r.pendingConfIndex = r.raftLog.lastIndex() + uint64(i) + 1
