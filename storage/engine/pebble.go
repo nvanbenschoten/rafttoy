@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/storage/wal"
+	"github.com/nvanbenschoten/rafttoy/proposal"
+	"github.com/nvanbenschoten/rafttoy/storage/wal"
 	pdb "github.com/petermattis/pebble"
 	"github.com/petermattis/pebble/db"
 	"go.etcd.io/etcd/raft"

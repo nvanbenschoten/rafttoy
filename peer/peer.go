@@ -7,12 +7,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nvanbenschoten/raft-toy/pipeline"
-	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/storage"
-	"github.com/nvanbenschoten/raft-toy/transport"
-	transpb "github.com/nvanbenschoten/raft-toy/transport/transportpb"
-	"github.com/nvanbenschoten/raft-toy/util"
+	"github.com/nvanbenschoten/rafttoy/pipeline"
+	"github.com/nvanbenschoten/rafttoy/proposal"
+	"github.com/nvanbenschoten/rafttoy/storage"
+	"github.com/nvanbenschoten/rafttoy/transport"
+	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
+	"github.com/nvanbenschoten/rafttoy/util"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -37,7 +37,7 @@ type Peer struct {
 	pb propBuf
 	pt proposal.Tracker
 
-	msgs            chan *transpb.RaftMsg
+	msgs         chan *transpb.RaftMsg
 	flushPropsFn func([]propBufElem)
 }
 
@@ -189,8 +189,8 @@ func (p *Peer) flushProps(es []propBufElem) {
 		p.pt.Register(es[i].enc, es[i].c)
 	}
 	if err := p.n.Step(raftpb.Message{
-		Type: raftpb.MsgProp,
-		From: p.cfg.ID,
+		Type:    raftpb.MsgProp,
+		From:    p.cfg.ID,
 		Entries: ents,
 	}); err != nil {
 		for i := range es {

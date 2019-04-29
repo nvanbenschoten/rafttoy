@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nvanbenschoten/raft-toy/peer"
-	"github.com/nvanbenschoten/raft-toy/util"
+	"github.com/nvanbenschoten/rafttoy/peer"
+	"github.com/nvanbenschoten/rafttoy/util"
 	"github.com/spf13/pflag"
 	"go.etcd.io/etcd/raft"
 )

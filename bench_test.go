@@ -6,9 +6,9 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/nvanbenschoten/raft-toy/metric"
-	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/storage/engine"
+	"github.com/nvanbenschoten/rafttoy/metric"
+	"github.com/nvanbenschoten/rafttoy/proposal"
+	"github.com/nvanbenschoten/rafttoy/storage/engine"
 	"golang.org/x/sync/errgroup"
 )
 

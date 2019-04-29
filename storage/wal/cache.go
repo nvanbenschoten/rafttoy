@@ -3,7 +3,7 @@ package wal
 import (
 	"math"
 
-	"github.com/nvanbenschoten/raft-toy/util/raftentry"
+	"github.com/nvanbenschoten/rafttoy/util/raftentry"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 

@@ -1,4 +1,4 @@
-module github.com/nvanbenschoten/raft-toy
+module github.com/nvanbenschoten/rafttoy
 
 require (
 	github.com/gogo/protobuf v1.2.1

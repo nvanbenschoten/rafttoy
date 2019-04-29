@@ -4,7 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/nvanbenschoten/raft-toy/proposal"
+	"github.com/nvanbenschoten/rafttoy/proposal"
 )
 
 const propBufCap = 1024

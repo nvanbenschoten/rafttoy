@@ -4,8 +4,8 @@ PKGS := $$($(GO) list ./... | grep -v /vendor/)
 
 .PHONY: build
 build:
-	$(GO) test -c $(MOD) -o raft-toy-leader
-	$(GO) build   $(MOD) -o raft-toy-follower
+	$(GO) test -c $(MOD) -o rafttoy-leader
+	$(GO) build   $(MOD) -o rafttoy-follower
 
 .PHONY: test
 test:

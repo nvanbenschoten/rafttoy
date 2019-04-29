@@ -8,13 +8,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nvanbenschoten/raft-toy/metric"
-	"github.com/nvanbenschoten/raft-toy/peer"
-	"github.com/nvanbenschoten/raft-toy/pipeline"
-	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/storage"
-	"github.com/nvanbenschoten/raft-toy/storage/engine"
-	"github.com/nvanbenschoten/raft-toy/transport"
+	"github.com/nvanbenschoten/rafttoy/metric"
+	"github.com/nvanbenschoten/rafttoy/peer"
+	"github.com/nvanbenschoten/rafttoy/pipeline"
+	"github.com/nvanbenschoten/rafttoy/proposal"
+	"github.com/nvanbenschoten/rafttoy/storage"
+	"github.com/nvanbenschoten/rafttoy/storage/engine"
+	"github.com/nvanbenschoten/rafttoy/transport"
 )
 
 func newPeer(epoch int32) *peer.Peer {

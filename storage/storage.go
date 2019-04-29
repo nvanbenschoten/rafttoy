@@ -1,8 +1,8 @@
 package storage
 
 import (
-	"github.com/nvanbenschoten/raft-toy/storage/engine"
-	"github.com/nvanbenschoten/raft-toy/storage/wal"
+	"github.com/nvanbenschoten/rafttoy/storage/engine"
+	"github.com/nvanbenschoten/rafttoy/storage/wal"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 

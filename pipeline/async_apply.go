@@ -1,8 +1,8 @@
 package pipeline
 
 import (
-	"github.com/nvanbenschoten/raft-toy/metric"
-	"github.com/nvanbenschoten/raft-toy/proposal"
+	"github.com/nvanbenschoten/rafttoy/metric"
+	"github.com/nvanbenschoten/rafttoy/proposal"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )

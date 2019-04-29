@@ -1,7 +1,7 @@
 package util
 
 import (
-	"github.com/nvanbenschoten/raft-toy/storage"
+	"github.com/nvanbenschoten/rafttoy/storage"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )

@@ -1,7 +1,7 @@
 package transport
 
 import (
-	transpb "github.com/nvanbenschoten/raft-toy/transport/transportpb"
+	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
 	"go.etcd.io/etcd/raft/raftpb"
 )
 

@@ -3,9 +3,9 @@ package pipeline
 import (
 	"sync"
 
-	"github.com/nvanbenschoten/raft-toy/proposal"
-	"github.com/nvanbenschoten/raft-toy/storage"
-	"github.com/nvanbenschoten/raft-toy/transport"
+	"github.com/nvanbenschoten/rafttoy/proposal"
+	"github.com/nvanbenschoten/rafttoy/storage"
+	"github.com/nvanbenschoten/rafttoy/transport"
 	"go.etcd.io/etcd/raft"
 )
 

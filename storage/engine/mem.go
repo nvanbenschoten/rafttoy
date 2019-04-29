@@ -3,7 +3,7 @@ package engine
 import (
 	"log"
 
-	"github.com/nvanbenschoten/raft-toy/proposal"
+	"github.com/nvanbenschoten/rafttoy/proposal"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )

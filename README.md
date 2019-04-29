@@ -1,6 +1,6 @@
-# raft-toy
+# rafttoy
 
-`raft-toy` is a playground to experiment with Raft proposal pipeline optimizations
+`rafttoy` is a playground to experiment with Raft proposal pipeline optimizations
 build around the [`etcd/raft`](https://github.com/etcd-io/etcd/tree/master/raft)
 library. The project aims to be a speed-of-light measurement tool for a Raft
 proposal pipeline implementation similar to the one in [CockroachDB](https://github.com/cockroachdb/cockroach).
@@ -39,19 +39,19 @@ New metrics can be defined in `metrics/metrics.go`.
 > GOOS=linux make build
 
 # Distribute binaries to the cluster
-> roachprod put $CLUSTER:1   raft-toy-leader
-> roachprod put $CLUSTER:2,3 raft-toy-follower
+> roachprod put $CLUSTER:1   rafttoy-leader
+> roachprod put $CLUSTER:2,3 rafttoy-follower
 
 # Open three terminals and ssh into each of the machines.
 # Start the two follower processes first. These currently need to be restarted
 # after each leader process finishes.
-CLUSTER:2> ./raft-toy-follower --peers='<vm1 ip>:1234,<vm2 ip>:1235,<vm3 ip>:1236' --id=2 \
+CLUSTER:2> ./rafttoy-follower --peers='<vm1 ip>:1234,<vm2 ip>:1235,<vm3 ip>:1236' --id=2 \
     --data-dir=/mnt/data1 --pipeline=parallel-append
-CLUSTER:3> ./raft-toy-follower --peers='<vm1 ip>:1234,<vm2 ip>:1235,<vm3 ip>:1236' --id=3 \
+CLUSTER:3> ./rafttoy-follower --peers='<vm1 ip>:1234,<vm2 ip>:1235,<vm3 ip>:1236' --id=3 \
     --data-dir=/mnt/data1 --pipeline=parallel-append
 
 # Start the leader process. This can be configured to run a series of benchmarks.
-CLUSTER:1> ./raft-toy-leader --peers='<vm1 ip>:1234,<vm2 ip>:1235,<vm3 ip>:1236' --id=1 \
+CLUSTER:1> ./rafttoy-leader --peers='<vm1 ip>:1234,<vm2 ip>:1235,<vm3 ip>:1236' --id=1 \
     --data-dir=/mnt/data1 --pipeline=parallel-append \
     --test.bench=BenchmarkRaft/conc=./bytes=256 --test.benchtime=2s --test.count=3
 

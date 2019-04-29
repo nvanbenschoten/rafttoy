@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	transpb "github.com/nvanbenschoten/raft-toy/transport/transportpb"
+	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
 	"go.etcd.io/etcd/raft/raftpb"
 	rpc "google.golang.org/grpc"
 )
@@ -24,7 +24,7 @@ type grpc struct {
 	dialCancel func()
 	clientMu   sync.Mutex
 	clientBufs map[uint64]chan<- *transpb.RaftMsg
-	sortBuf byDestination
+	sortBuf    byDestination
 }
 
 // NewGRPC creates a new Transport that uses gRPC streams.
