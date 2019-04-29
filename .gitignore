@@ -4,9 +4,9 @@
 *.dll
 *.so
 *.dylib
-raft-toy
-raft-toy-leader
-raft-toy-follower
+rafttoy
+rafttoy-leader
+rafttoy-follower
 
 # Test binary, build with `go test -c`
 *.test
