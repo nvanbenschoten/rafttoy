@@ -37,7 +37,9 @@ func BenchmarkRaft(b *testing.B) {
 }
 
 func benchmarkRaft(b *testing.B, conc, bytes int) {
-	p := newPeer(newEpoch())
+	cfg := cfgFromFlags()
+	cfg.Epoch = newEpoch()
+	p := newPeer(cfg)
 	go p.Run()
 	defer p.Stop()
 

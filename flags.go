@@ -17,6 +17,7 @@ var raftID = pflag.Uint64("id", 1, "ID of this process in the Raft replication g
 var raftPeers = pflag.StringSlice("peers", []string{"localhost:1234"}, "IP address of each peer in the Raft replication group")
 var runLoad = pflag.Bool("load", false, "Propose changes to Raft")
 var verbose = pflag.Bool("verbose", false, "Verbose logging")
+var pprof = pflag.Int("pprof", 0, "Port to serve pprof on. Negative to disable")
 var recordMetrics = pflag.Bool("metrics", false, "Record metrics and print before exiting")
 var dataDir = pflag.String("data-dir", "", "Directory to store persistent data")
 var pipelineImpl = pflag.String("pipeline", "basic", "Raft proposal pipeline implementation")

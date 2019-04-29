@@ -1,7 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"sync"
@@ -17,10 +21,7 @@ import (
 	"github.com/nvanbenschoten/rafttoy/transport"
 )
 
-func newPeer(epoch int32) *peer.Peer {
-	cfg := cfgFromFlags()
-	cfg.Epoch = epoch
-
+func newPeer(cfg peer.Config) *peer.Peer {
 	//    CONFIGURE PLUGGABLE COMPONENTS HERE:
 	// It would be nice to inject these directly from
 	// the benchmarks, but that doesn't work well when
@@ -62,11 +63,12 @@ func newPeer(epoch int32) *peer.Peer {
 }
 
 func main() {
-
+	servePProf(*pprof)
 	printMetrics := metric.Enable(*recordMetrics)
 	defer printMetrics()
 
-	p := newPeer(0)
+	cfg := cfgFromFlags()
+	p := newPeer(cfg)
 
 	// Make sure we clean up before exiting.
 	c := make(chan os.Signal, 1)
@@ -110,6 +112,23 @@ func main() {
 			}
 		}()
 	}
+}
+
+func servePProf(port int) {
+	if port < 0 {
+		return
+	}
+	addr := fmt.Sprintf(":%d", port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("serving pprof on %s", ln.Addr())
+	go func() {
+		if err := http.Serve(ln, nil); err != nil {
+			log.Fatal(err)
+		}
+	}()
 }
 
 func becomeLeader(p *peer.Peer) {
