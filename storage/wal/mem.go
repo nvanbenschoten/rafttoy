@@ -2,6 +2,7 @@ package wal
 
 import (
 	"log"
+	"math"
 
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -25,7 +26,7 @@ func (m *mem) Append(ents []raftpb.Entry) {
 }
 
 func (m *mem) Entries(lo, hi uint64) []raftpb.Entry {
-	ents, err := m.m.Entries(lo, hi, 0)
+	ents, err := m.m.Entries(lo, hi, math.MaxUint64)
 	if err != nil {
 		log.Fatal(err)
 	}
