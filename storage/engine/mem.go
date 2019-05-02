@@ -2,6 +2,7 @@ package engine
 
 import (
 	"log"
+	"unsafe"
 
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"go.etcd.io/etcd/raft"
@@ -29,7 +30,11 @@ func (m *mem) SetHardState(st raftpb.HardState, _ bool) {
 
 func (m *mem) ApplyEntry(ent raftpb.Entry) {
 	prop := proposal.Decode(ent.Data)
-	m.kv[string(prop.Key)] = prop.Val
+	m.kv[unsafeString(prop.Key)] = prop.Val
+}
+
+func unsafeString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
 }
 
 func (m *mem) Clear() {

@@ -38,8 +38,9 @@ type asyncEvent struct {
 // NewAsyncApplier creates a new "async applier" pipeline.
 func NewAsyncApplier(earlyAck, lazyFollower bool) Pipeline {
 	return &asyncApplier{
-		earlyAck: earlyAck,
-		toApply:  make(chan asyncEvent, 512),
+		earlyAck:     earlyAck,
+		lazyFollower: lazyFollower,
+		toApply:      make(chan asyncEvent, 512),
 	}
 }
 
