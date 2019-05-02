@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"math/rand"
+	"os"
 	"strconv"
 	"time"
 
@@ -41,6 +42,11 @@ func init() {
 	})
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
+
+	// Setup logging.
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("rafttoy | ")
+	log.SetFlags(log.LstdFlags)
 	util.SetRaftLoggingVerbosity(*verbose)
 }
 

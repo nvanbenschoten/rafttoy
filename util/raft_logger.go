@@ -11,7 +11,8 @@ import (
 func SetRaftLoggingVerbosity(verbose bool) {
 	var l raft.Logger
 	if verbose {
-		def := &raft.DefaultLogger{Logger: log.New(os.Stderr, "raft", log.LstdFlags)}
+		stdLogger := log.New(os.Stderr, log.Prefix(), log.Flags())
+		def := &raft.DefaultLogger{Logger: stdLogger}
 		def.EnableDebug()
 		def.EnableTimestamps()
 		l = def
