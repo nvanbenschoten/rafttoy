@@ -110,7 +110,6 @@ func applyToStore(
 		be.ApplyEntries(ents[st:])
 
 		if ack {
-			l.Lock()
 			for i := range ents {
 				ent := &ents[i]
 				switch ent.Type {
@@ -125,7 +124,6 @@ func applyToStore(
 					panic("unexpected")
 				}
 			}
-			l.Unlock()
 		}
 	} else {
 		// Apply and ack entries, one at a time.
@@ -139,9 +137,7 @@ func applyToStore(
 				s.ApplyEntry(*ent)
 				if ack {
 					ec := proposal.EncProposal(ent.Data)
-					l.Lock()
 					pt.Finish(ec.GetID(), true)
-					l.Unlock()
 				}
 			case raftpb.EntryConfChange:
 				var cc raftpb.ConfChange

@@ -226,9 +226,6 @@ func (p *Peer) flushMsgs() {
 }
 
 func (p *Peer) bumpEpoch(epoch int32) {
-	if p.pt.Len() > 0 {
-		log.Fatal("cannot reset peer with in-flight proposals")
-	}
 	// Clear all persistent state and create a new Raft node.
 	p.pl.Pause()
 	p.s.Truncate()

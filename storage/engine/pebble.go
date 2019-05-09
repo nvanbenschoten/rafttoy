@@ -94,7 +94,7 @@ func (p *pebble) ApplyEntries(ents []raftpb.Entry) {
 			log.Fatal(err)
 		}
 	}
-	if err := b.Commit(db.Sync); err != nil {
+	if err := b.Commit(db.NoSync); err != nil {
 		log.Fatal(err)
 	}
 }

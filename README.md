@@ -33,7 +33,7 @@ New metrics can be defined in `metrics/metrics.go`.
 ```
 # Create a roachprod cluster
 > export CLUSTER=$USER-raft
-> roachprod create $CLUSTER -nodes=3 --clouds=aws --aws-machine-type-ssd=m5d.4xlarge
+> roachprod create $CLUSTER --nodes=3 --clouds=aws --aws-machine-type-ssd=m5d.4xlarge
 
 # Build the leader and follower binaries for linux. Requires Go 1.12.
 > GOOS=linux make build
