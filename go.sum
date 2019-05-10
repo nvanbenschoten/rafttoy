@@ -91,7 +91,7 @@ github.com/ugorji/go/codec v0.0.0-20190204201341-e444a5086c43/go.mod h1:iT03XoTw
 github.com/urfave/cli v1.20.0/go.mod h1:70zkFmudgCuE/ngEzBv17Jvp/497gISqfk5gWijbERA=
 github.com/xiang90/probing v0.0.0-20190116061207-43a291ad63a2/go.mod h1:UETIi67q53MR2AWcXfiuqkDkRtnGDLqkBTpCHuJHxtU=
 go.etcd.io/bbolt v1.3.2/go.mod h1:IbVyRI1SCnLcuJnV2u8VeU0CEYM7e686BmAb1XKL+uU=
-go.etcd.io/etcd v0.0.0-20190417191421-cd7ffbe2270d h1:e9wo83KcuYgsnllPD+jumnGcj//lS6fRSz97LE0WPJ4=
+go.etcd.io/etcd v0.0.0-20190417191421-cd7ffbe2270d h1:ckhXImIub+PVniGpxbXZQeoGwtWLAUtlqya1HZvYzBA=
 go.etcd.io/etcd v0.0.0-20190417191421-cd7ffbe2270d/go.mod h1:KSGwdbiFchh5KIC9My2+ZVl5/3ANcwohw50dpPwa2cw=
 go.etcd.io/etcd v0.0.0-20190425060523-cca0d5c1bed1 h1:xrG8gcsPMZwSN0OUTGT5T7DtmdOeTpxbic26vDtqOoc=
 go.etcd.io/etcd v0.0.0-20190425060523-cca0d5c1bed1/go.mod h1:dNVoPOOuVFIPUanhzFuVeJ8eYRljmWRVTa4pS2jUNno=
