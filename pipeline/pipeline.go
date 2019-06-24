@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nvanbenschoten/rafttoy/config"
 	"github.com/nvanbenschoten/rafttoy/metric"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage"
@@ -18,10 +19,10 @@ import (
 // the interactions between a Raft "raw node" and the various components that
 // the Raft "raw node" needs to coordinate with.
 type Pipeline interface {
-	Init(int32, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker)
+	Init(config.TestEpoch, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker)
 	Start()
 	Pause()
-	Resume(int32, *raft.RawNode)
+	Resume(config.TestEpoch, *raft.RawNode)
 	Stop()
 	RunOnce()
 }
@@ -55,7 +56,7 @@ func saveToDisk(s storage.Storage, ents []raftpb.Entry, st raftpb.HardState, syn
 	}
 }
 
-func sendMessages(t transport.Transport, epoch int32, msgs []raftpb.Message) {
+func sendMessages(t transport.Transport, epoch config.TestEpoch, msgs []raftpb.Message) {
 	if len(msgs) > 0 {
 		t.Send(epoch, msgs)
 	}

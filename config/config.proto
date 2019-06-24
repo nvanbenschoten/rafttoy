@@ -1,0 +1,11 @@
+syntax = "proto3";
+package config;
+
+import "gogoproto/gogo.proto";
+
+message TestEpoch {
+    option (gogoproto.goproto_stringer) = false;
+
+    int64 process_nanos = 1;
+    int32 bench_iter    = 2;
+}

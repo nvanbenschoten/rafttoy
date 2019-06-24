@@ -3,12 +3,13 @@ package transportpb;
 
 import "gogoproto/gogo.proto";
 import "go.etcd.io/etcd/raft/raftpb/raft.proto";
+import "github.com/nvanbenschoten/rafttoy/config/config.proto";
 
 message RaftMsg {
     // Epoch indicates the test epoch that this message was sent from. Raft
     // state is reset when an epoch increment is detected and Raft messages
     // from previous epochs are discarded.
-    int32 epoch = 1;
+    config.TestEpoch epoch = 1 [(gogoproto.nullable) = false];
     // Msgs is a group of wrapped Raft message.
     repeated raftpb.Message msgs = 2 [(gogoproto.nullable) = false];
 }

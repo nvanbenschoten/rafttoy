@@ -26,4 +26,5 @@ vendor:
 
 .PHONY: proto
 proto:
+	@$(MAKE) -C config regenerate
 	@$(MAKE) -C transport/transportpb regenerate

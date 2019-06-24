@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"github.com/nvanbenschoten/rafttoy/config"
 	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -9,7 +10,7 @@ import (
 type Transport interface {
 	Init(addr string, peers map[uint64]string)
 	Serve(RaftHandler)
-	Send(epoch int32, msgs []raftpb.Message)
+	Send(epoch config.TestEpoch, msgs []raftpb.Message)
 	Close()
 }
 

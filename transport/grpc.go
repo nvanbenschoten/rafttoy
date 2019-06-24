@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/nvanbenschoten/rafttoy/config"
 	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
 	"go.etcd.io/etcd/raft/raftpb"
 	rpc "google.golang.org/grpc"
@@ -82,7 +83,7 @@ func (g *grpc) RaftMessage(stream transpb.RaftService_RaftMessageServer) error {
 	}
 }
 
-func (g *grpc) Send(epoch int32, msgs []raftpb.Message) {
+func (g *grpc) Send(epoch config.TestEpoch, msgs []raftpb.Message) {
 	// Group messages by destination and combine.
 	g.sortMsgs(msgs)
 	st := 0

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"sync"
 
+	"github.com/nvanbenschoten/rafttoy/config"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage"
 	"github.com/nvanbenschoten/rafttoy/transport"
@@ -12,7 +13,7 @@ import (
 // basic is a standard proposal pipeline. It mirrors the
 // approach described in the etcd/raft documentation.
 type basic struct {
-	epoch int32
+	epoch config.TestEpoch
 	l     sync.Locker
 	n     *raft.RawNode
 	s     storage.Storage
@@ -26,7 +27,7 @@ func NewBasic() Pipeline {
 }
 
 func (pl *basic) Init(
-	epoch int32,
+	epoch config.TestEpoch,
 	l sync.Locker,
 	n *raft.RawNode,
 	s storage.Storage,
@@ -55,7 +56,7 @@ func (pl *basic) RunOnce() {
 
 func (pl *basic) Start() {}
 func (pl *basic) Pause() {}
-func (pl *basic) Resume(epoch int32, n *raft.RawNode) {
+func (pl *basic) Resume(epoch config.TestEpoch, n *raft.RawNode) {
 	pl.epoch = epoch
 	pl.n = n
 }

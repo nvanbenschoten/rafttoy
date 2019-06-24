@@ -3,7 +3,9 @@ package main
 import (
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/nvanbenschoten/rafttoy/config"
 	"github.com/nvanbenschoten/rafttoy/metric"
 	"github.com/nvanbenschoten/rafttoy/storage/engine"
 	"github.com/nvanbenschoten/rafttoy/util"
@@ -11,15 +13,20 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// epoch represents a single iteration of a `go bench` loop. Tracking it and
-// threading it through Raft messages allows a single instance of `go bench`
-// to coordinate Raft state machine resets across a cluster of Go processes.
-var epoch int32
+// processNanos represents the time that the process started.
+var processNanos = time.Now().UnixNano()
 
-func newEpoch() int32 {
-	e := epoch
-	epoch++
-	return e
+// benchIter represents a single iteration of a `go bench` loop. Tracking it and
+// threading it through Raft messages allows a single instance of `go bench` to
+// coordinate Raft state machine resets across a cluster of Go processes.
+var benchIter int32
+
+func newEpoch() config.TestEpoch {
+	benchIter++
+	return config.TestEpoch{
+		ProcessNanos: processNanos,
+		BenchIter:    benchIter,
+	}
 }
 
 func TestMain(m *testing.M) {

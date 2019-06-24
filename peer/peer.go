@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nvanbenschoten/rafttoy/config"
 	"github.com/nvanbenschoten/rafttoy/pipeline"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage"
@@ -43,7 +44,7 @@ type Peer struct {
 
 // Config contains configurations for constructing a Peer.
 type Config struct {
-	Epoch     int32
+	Epoch     config.TestEpoch
 	ID        uint64
 	Peers     []raft.Peer
 	SelfAddr  string
@@ -209,11 +210,11 @@ func (p *Peer) flushMsgs() {
 	for {
 		select {
 		case m := <-p.msgs:
-			if m.Epoch < p.cfg.Epoch {
+			if m.Epoch.Less(p.cfg.Epoch) {
 				return
 			}
-			if m.Epoch > p.cfg.Epoch {
-				log.Printf("bumping test epoch to %d", m.Epoch)
+			if p.cfg.Epoch.Less(m.Epoch) {
+				log.Printf("bumping test epoch to %s", m.Epoch)
 				p.bumpEpoch(m.Epoch)
 			}
 			for i := range m.Msgs {
@@ -225,7 +226,7 @@ func (p *Peer) flushMsgs() {
 	}
 }
 
-func (p *Peer) bumpEpoch(epoch int32) {
+func (p *Peer) bumpEpoch(epoch config.TestEpoch) {
 	// Clear all persistent state and create a new Raft node.
 	p.pl.Pause()
 	p.s.Truncate()
