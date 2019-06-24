@@ -18,6 +18,7 @@ import (
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage"
 	"github.com/nvanbenschoten/rafttoy/storage/engine"
+	"github.com/nvanbenschoten/rafttoy/storage/wal"
 	"github.com/nvanbenschoten/rafttoy/transport"
 )
 
@@ -29,12 +30,14 @@ func newPeer(cfg peer.Config) *peer.Peer {
 
 	// Storage.
 	//  WAL.
+	var _ wal.Wal // avoid import thrashing
 	// w := wal.NewMem()
 	// w := engine.NewPebble(*dataDir, false).(wal.Wal)
 	// w := wal.NewEtcdWal(*dataDir)
 	//  Engine.
 	// e := engine.NewMem()
 	// e := engine.NewPebble(*dataDir, false)
+	// e := engine.NewPebble(*dataDir, true)
 	//  Combined.
 	// s := storage.CombineWalAndEngine(w, e)
 	s := engine.NewPebble(*dataDir, false).(storage.Storage)

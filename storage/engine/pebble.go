@@ -37,9 +37,6 @@ type pebble struct {
 
 // NewPebble creates an LSM-based storage engine using Pebble.
 func NewPebble(root string, disableWAL bool) Engine {
-	if disableWAL {
-		log.Fatal("disable wal is currently broken")
-	}
 	dir := randDir(root)
 	opts := &db.Options{
 		DisableWAL: disableWAL,
@@ -65,7 +62,7 @@ func (p *pebble) SetHardState(st raftpb.HardState, sync bool) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := p.db.Set(hardStateKey, buf, optsForSync(sync)); err != nil {
+	if err := p.db.Set(hardStateKey, buf, optsForSync(sync && !p.opts.DisableWAL)); err != nil {
 		log.Fatal(err)
 	}
 }
