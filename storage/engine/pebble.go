@@ -8,10 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 
+	pdb "github.com/cockroachdb/pebble"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage/wal"
-	pdb "github.com/petermattis/pebble"
-	"github.com/petermattis/pebble/db"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -30,7 +29,7 @@ var hardStateKey = append(minMetaKey, []byte("hs")...)
 
 type pebble struct {
 	db   *pdb.DB
-	opts *db.Options
+	opts *pdb.Options
 	dir  string
 	c    wal.LogCache
 }
@@ -38,7 +37,7 @@ type pebble struct {
 // NewPebble creates an LSM-based storage engine using Pebble.
 func NewPebble(root string, disableWAL bool) Engine {
 	dir := randDir(root)
-	opts := &db.Options{
+	opts := &pdb.Options{
 		DisableWAL: disableWAL,
 	}
 	db, err := pdb.Open(dir, opts)
@@ -69,7 +68,7 @@ func (p *pebble) SetHardState(st raftpb.HardState, sync bool) {
 
 func (p *pebble) ApplyEntry(ent raftpb.Entry) {
 	prop := proposal.Decode(ent.Data)
-	if err := p.db.Set(prop.Key, prop.Val, db.NoSync); err != nil {
+	if err := p.db.Set(prop.Key, prop.Val, pdb.NoSync); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -91,7 +90,7 @@ func (p *pebble) ApplyEntries(ents []raftpb.Entry) {
 			log.Fatal(err)
 		}
 	}
-	if err := b.Commit(db.NoSync); err != nil {
+	if err := b.Commit(pdb.NoSync); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -166,7 +165,7 @@ func (p *pebble) Append(ents []raftpb.Entry) {
 	b := p.db.NewBatch()
 	defer b.Close()
 	appendEntsToBatch(b, ents)
-	if err := b.Commit(db.Sync); err != nil {
+	if err := b.Commit(pdb.Sync); err != nil {
 		log.Fatal(err)
 	}
 	p.c.UpdateOnAppend(ents)
@@ -228,13 +227,14 @@ func (p *pebble) Term(i uint64) uint64 {
 	var kArr [maxLogKeyLen]byte
 	k := kArr[:encodeRaftLogKey(kArr[:], i)]
 
-	buf, err := p.db.Get(k)
+	buf, closer, err := p.db.Get(k)
 	if err != nil {
-		if err == db.ErrNotFound {
+		if err == pdb.ErrNotFound {
 			return 0
 		}
 		log.Fatal(err)
 	}
+	defer closer.Close()
 
 	var ent raftpb.Entry
 	if err := ent.Unmarshal(buf); err != nil {
@@ -289,9 +289,9 @@ func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState,
 	}
 }
 
-func optsForSync(sync bool) *db.WriteOptions {
+func optsForSync(sync bool) *pdb.WriteOptions {
 	if sync {
-		return db.Sync
+		return pdb.Sync
 	}
-	return db.NoSync
+	return pdb.NoSync
 }

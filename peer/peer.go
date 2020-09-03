@@ -16,6 +16,7 @@ import (
 	"github.com/nvanbenschoten/rafttoy/util"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/tracker"
 )
 
 // Peer is a member of a Raft consensus group. Its primary roles are to:
@@ -72,10 +73,11 @@ func New(
 	pl pipeline.Pipeline,
 ) *Peer {
 	raftCfg := makeRaftCfg(cfg, s)
-	n, err := raft.NewRawNode(raftCfg, cfg.Peers)
+	n, err := raft.NewRawNode(raftCfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	n.Bootstrap(cfg.Peers)
 
 	p := &Peer{
 		sig:  make(chan struct{}, 1),
@@ -233,10 +235,11 @@ func (p *Peer) bumpEpoch(epoch config.TestEpoch) {
 	p.s.Clear()
 	p.cfg.Epoch = epoch
 	raftCfg := makeRaftCfg(p.cfg, p.s)
-	n, err := raft.NewRawNode(raftCfg, p.cfg.Peers)
+	n, err := raft.NewRawNode(raftCfg)
 	if err != nil {
 		log.Fatal(err)
 	}
+	n.Bootstrap(p.cfg.Peers)
 	p.n = n
 	p.pl.Resume(epoch, n)
 }
@@ -247,7 +250,7 @@ func (p *Peer) WaitForAllCaughtUp() {
 		p.mu.Lock()
 		var match uint64
 		caughtUp := true
-		p.n.WithProgress(func(id uint64, _ raft.ProgressType, pr raft.Progress) {
+		p.n.WithProgress(func(id uint64, _ raft.ProgressType, pr tracker.Progress) {
 			if match == 0 {
 				match = pr.Match
 			} else {
