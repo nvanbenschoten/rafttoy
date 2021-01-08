@@ -24,8 +24,9 @@ type unstable struct {
 	// the incoming unstable snapshot, if any.
 	snapshot *pb.Snapshot
 	// all entries that have not yet been written to storage.
-	entries []pb.Entry
-	offset  uint64
+	entries          []pb.Entry
+	offset           uint64
+	inProgressOffset uint64
 
 	logger Logger
 }
@@ -87,6 +88,27 @@ func (u *unstable) stableTo(i, t uint64) {
 	}
 }
 
+func (u *unstable) inProgressTo(i, t uint64) {
+	gt, ok := u.maybeTerm(i)
+	if !ok {
+		return
+	}
+	// if i < offset, term is matched with the snapshot
+	// only update the unstable entries if term is matched with
+	// an unstable entry.
+	if gt == t && i >= u.inProgressOffset {
+		u.inProgressOffset = i + 1
+	}
+}
+
+func (u *unstable) notAlreadyInProgress() []pb.Entry {
+	diff := int(u.inProgressOffset) - int(u.offset)
+	if diff < 0 {
+		diff = 0
+	}
+	return u.entries[diff:]
+}
+
 // shrinkEntriesArray discards the underlying array used by the entries slice
 // if most of it isn't being used. This avoids holding references to a bunch of
 // potentially large entries that aren't needed anymore. Simply clearing the
@@ -114,6 +136,7 @@ func (u *unstable) stableSnapTo(i uint64) {
 
 func (u *unstable) restore(s pb.Snapshot) {
 	u.offset = s.Metadata.Index + 1
+	u.inProgressOffset = u.offset
 	u.entries = nil
 	u.snapshot = &s
 }
@@ -130,6 +153,7 @@ func (u *unstable) truncateAndAppend(ents []pb.Entry) {
 		// The log is being truncated to before our current offset
 		// portion, so set the offset and replace the entries
 		u.offset = after
+		u.inProgressOffset = u.offset
 		u.entries = ents
 	default:
 		// truncate to after and copy to u.entries

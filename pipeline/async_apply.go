@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"sync"
+
 	"github.com/nvanbenschoten/rafttoy/metric"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"go.etcd.io/etcd/raft/v3"
@@ -26,7 +28,19 @@ type asyncApplier struct {
 	earlyAck     bool
 	lazyFollower bool
 	leader       bool
-	toApply      chan asyncEvent
+
+	toAppend struct {
+		mu    sync.Mutex
+		cond  sync.Cond
+		slice []appendEvent
+	}
+	toApply chan asyncEvent
+}
+
+type appendEvent struct {
+	ents []raftpb.Entry
+	sync chan struct{}
+	stop chan struct{}
 }
 
 type asyncEvent struct {
@@ -37,11 +51,13 @@ type asyncEvent struct {
 
 // NewAsyncApplier creates a new "async applier" pipeline.
 func NewAsyncApplier(earlyAck, lazyFollower bool) Pipeline {
-	return &asyncApplier{
+	pl := &asyncApplier{
 		earlyAck:     earlyAck,
 		lazyFollower: lazyFollower,
 		toApply:      make(chan asyncEvent, 512),
 	}
+	pl.toAppend.cond.L = &pl.toAppend.mu
+	return pl
 }
 
 func (pl *asyncApplier) RunOnce() {
@@ -56,12 +72,48 @@ func (pl *asyncApplier) RunOnce() {
 	}
 	msgApps, otherMsgs := splitMsgApps(rd.Messages)
 	sendMessages(pl.t, pl.epoch, msgApps)
-	saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)
+	if rd.MustSync {
+		// Flush async appends if the vote or term changed, then synchronously
+		// save the update. NOTE: MustSync's definition was changed to ignore
+		// entries.
+		syncC := make(chan struct{})
+		pl.appendAsyncEvent(appendEvent{sync: syncC})
+		<-syncC
+		saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)
+	} else {
+		if len(rd.Entries) > 0 {
+			pl.appendAsync(rd.Entries)
+		}
+		if !raft.IsEmptyHardState(rd.HardState) {
+			// HardState.Commit index changed. Update without syncing.
+			pl.s.SetHardState(rd.HardState, false /* sync */)
+		}
+	}
 	sendMessages(pl.t, pl.epoch, otherMsgs)
 	processSnapshot(rd.Snapshot)
 	pl.maybeApplyAsync(rd.CommittedEntries)
 	pl.l.Lock()
 	pl.n.Advance(rd)
+	if rd.MustSync && len(rd.Entries) > 0 {
+		pl.n.StableTo(rd.Entries[len(rd.Entries)-1])
+	}
+	if pl.n.HasReady() {
+		pl.signal()
+	}
+}
+
+func (pl *asyncApplier) appendAsync(ents []raftpb.Entry) {
+	pl.appendAsyncEvent(appendEvent{ents: ents})
+}
+
+func (pl *asyncApplier) appendAsyncEvent(ev appendEvent) {
+	pl.toAppend.mu.Lock()
+	empty := len(pl.toAppend.slice) == 0
+	pl.toAppend.slice = append(pl.toAppend.slice, ev)
+	pl.toAppend.mu.Unlock()
+	if empty {
+		pl.toAppend.cond.Signal()
+	}
 }
 
 func (pl *asyncApplier) maybeApplyAsync(ents []raftpb.Entry) {
@@ -90,6 +142,51 @@ func (pl *asyncApplier) maybeApplyAsync(ents []raftpb.Entry) {
 }
 
 func (pl *asyncApplier) Start() {
+	// Start appender goroutine.
+	go func() {
+		var evs []appendEvent
+		var ents []raftpb.Entry
+		for {
+			pl.toAppend.mu.Lock()
+			for {
+				if len(pl.toAppend.slice) > 0 {
+					evs, pl.toAppend.slice = pl.toAppend.slice, evs
+					break
+				}
+				pl.toAppend.cond.Wait()
+			}
+			pl.toAppend.mu.Unlock()
+
+			for _, ev := range evs {
+				ents = append(ents, ev.ents...)
+			}
+
+			if len(ents) > 0 {
+				pl.s.Append(ents)
+				pl.l.Lock()
+				pl.n.StableTo(ents[len(ents)-1])
+				if pl.n.HasReady() {
+					pl.signal()
+				}
+				pl.l.Unlock()
+			}
+
+			for _, ev := range evs {
+				if ev.stop != nil {
+					close(ev.stop)
+					return
+				}
+				if ev.sync != nil {
+					close(ev.sync)
+				}
+			}
+
+			evs = evs[:0]
+			ents = ents[:0]
+		}
+	}()
+
+	// Start applier goroutine.
 	go func() {
 		for ev := range pl.toApply {
 			if ev.stop != nil {
@@ -126,14 +223,23 @@ func (pl *asyncApplier) Start() {
 }
 
 func (pl *asyncApplier) Pause() {
-	// Flush toApply channel.
+	// Flush toAppend channel.
 	syncC := make(chan struct{})
+	pl.appendAsyncEvent(appendEvent{sync: syncC})
+	<-syncC
+	// Flush toApply channel.
+	syncC = make(chan struct{})
 	pl.toApply <- asyncEvent{sync: syncC}
 	<-syncC
 }
 
 func (pl *asyncApplier) Stop() {
+	// Flush toAppend channel.
 	stoppedC := make(chan struct{})
+	pl.appendAsyncEvent(appendEvent{stop: stoppedC})
+	<-stoppedC
+	// Flush toApply channel.
+	stoppedC = make(chan struct{})
 	pl.toApply <- asyncEvent{stop: stoppedC}
 	<-stoppedC
 }

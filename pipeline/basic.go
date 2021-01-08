@@ -13,12 +13,13 @@ import (
 // basic is a standard proposal pipeline. It mirrors the
 // approach described in the etcd/raft documentation.
 type basic struct {
-	epoch config.TestEpoch
-	l     sync.Locker
-	n     *raft.RawNode
-	s     storage.Storage
-	t     transport.Transport
-	pt    *proposal.Tracker
+	epoch  config.TestEpoch
+	l      sync.Locker
+	n      *raft.RawNode
+	s      storage.Storage
+	t      transport.Transport
+	pt     *proposal.Tracker
+	signal func()
 }
 
 // NewBasic creates a new "basic" pipeline.
@@ -33,6 +34,7 @@ func (pl *basic) Init(
 	s storage.Storage,
 	t transport.Transport,
 	pt *proposal.Tracker,
+	signal func(),
 ) {
 	pl.epoch = epoch
 	pl.l = l
@@ -40,6 +42,7 @@ func (pl *basic) Init(
 	pl.s = s
 	pl.t = t
 	pl.pt = pt
+	pl.signal = signal
 }
 
 func (pl *basic) RunOnce() {

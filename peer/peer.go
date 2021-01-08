@@ -90,7 +90,7 @@ func New(
 		msgs: make(chan *transpb.RaftMsg, 1024),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
-	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)
+	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt, p.signal)
 	p.pb.init()
 	p.flushPropsFn = p.flushProps
 	go p.t.Serve(p)

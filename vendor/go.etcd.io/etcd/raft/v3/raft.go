@@ -587,10 +587,20 @@ func (r *raft) advance(rd Ready) {
 
 	if len(rd.Entries) > 0 {
 		e := rd.Entries[len(rd.Entries)-1]
-		r.raftLog.stableTo(e.Index, e.Term)
+		r.raftLog.unstable.inProgressTo(e.Index, e.Term)
 	}
 	if !IsEmptySnap(rd.Snapshot) {
 		r.raftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
+	}
+}
+
+func (r *raft) stableTo(e pb.Entry) {
+	r.raftLog.stableTo(e.Index, e.Term)
+	if r.state == StateLeader {
+		r.prs.Progress[r.id].MaybeUpdate(e.Index)
+		r.maybeCommit()
+	} else if r.lead != None {
+		r.send(pb.Message{To: r.lead, Type: pb.MsgAppResp, Index: e.Index})
 	}
 }
 
@@ -650,9 +660,6 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 	}
 	// use latest "last" index after truncate/append
 	li = r.raftLog.append(es...)
-	r.prs.Progress[r.id].MaybeUpdate(li)
-	// Regardless of maybeCommit's return, our caller will call bcastAppend.
-	r.maybeCommit()
 	return true
 }
 
@@ -1377,9 +1384,7 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 
-	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
-		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
-	} else {
+	if _, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); !ok {
 		r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
 			r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: m.Index, Reject: true, RejectHint: r.raftLog.lastIndex()})

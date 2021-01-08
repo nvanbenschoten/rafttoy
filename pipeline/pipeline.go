@@ -19,7 +19,7 @@ import (
 // the interactions between a Raft "raw node" and the various components that
 // the Raft "raw node" needs to coordinate with.
 type Pipeline interface {
-	Init(config.TestEpoch, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker)
+	Init(config.TestEpoch, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker, func())
 	Start()
 	Pause()
 	Resume(config.TestEpoch, *raft.RawNode)

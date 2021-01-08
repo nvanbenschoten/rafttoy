@@ -139,10 +139,7 @@ func (l *raftLog) findConflict(ents []pb.Entry) uint64 {
 }
 
 func (l *raftLog) unstableEntries() []pb.Entry {
-	if len(l.unstable.entries) == 0 {
-		return nil
-	}
-	return l.unstable.entries
+	return l.unstable.notAlreadyInProgress()
 }
 
 // nextEnts returns all the available entries for execution.

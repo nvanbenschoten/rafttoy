@@ -584,5 +584,5 @@ func MustSync(st, prevst pb.HardState, entsnum int) bool {
 	// currentTerm
 	// votedFor
 	// log entries[]
-	return entsnum != 0 || st.Vote != prevst.Vote || st.Term != prevst.Term
+	return st.Vote != prevst.Vote || st.Term != prevst.Term
 }

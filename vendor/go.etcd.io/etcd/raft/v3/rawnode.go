@@ -178,6 +178,11 @@ func (rn *RawNode) Advance(rd Ready) {
 	rn.raft.advance(rd)
 }
 
+// StableTo informs the RawNode that its log is durable up to the provided Entry.
+func (rn *RawNode) StableTo(e pb.Entry) {
+	rn.raft.stableTo(e)
+}
+
 // Status returns the current status of the given group. This allocates, see
 // BasicStatus and WithProgress for allocation-friendlier choices.
 func (rn *RawNode) Status() Status {
