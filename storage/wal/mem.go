@@ -3,25 +3,31 @@ package wal
 import (
 	"log"
 	"math"
+	"time"
 
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 type mem struct {
-	m *raft.MemoryStorage
+	m     *raft.MemoryStorage
+	delay time.Duration
 }
 
 // NewMem creates a new in-memory write-ahead log.
-func NewMem() Wal {
+func NewMem(delay time.Duration) Wal {
 	return &mem{
-		m: raft.NewMemoryStorage(),
+		m:     raft.NewMemoryStorage(),
+		delay: delay,
 	}
 }
 
 func (m *mem) Append(ents []raftpb.Entry) {
 	if err := m.m.Append(ents); err != nil {
 		log.Fatal(err)
+	}
+	if m.delay != 0 {
+		time.Sleep(m.delay)
 	}
 }
 
