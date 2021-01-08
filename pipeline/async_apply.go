@@ -3,8 +3,8 @@ package pipeline
 import (
 	"github.com/nvanbenschoten/rafttoy/metric"
 	"github.com/nvanbenschoten/rafttoy/proposal"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // asyncApplier is a proposal pipeline that applies committed
@@ -47,13 +47,13 @@ func NewAsyncApplier(earlyAck, lazyFollower bool) Pipeline {
 func (pl *asyncApplier) RunOnce() {
 	defer measurePipelineLat()()
 	rd := pl.n.Ready()
+	pl.l.Unlock()
 	if rd.SoftState != nil {
 		pl.leader = rd.SoftState.RaftState == raft.StateLeader
 	}
 	if pl.earlyAck {
-		pl.ackCommittedEnts(rd.CommittedEntries)
+		ackCommittedEnts(pl.pt, rd.CommittedEntries)
 	}
-	pl.l.Unlock()
 	msgApps, otherMsgs := splitMsgApps(rd.Messages)
 	sendMessages(pl.t, pl.epoch, msgApps)
 	saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)
@@ -62,22 +62,6 @@ func (pl *asyncApplier) RunOnce() {
 	pl.maybeApplyAsync(rd.CommittedEntries)
 	pl.l.Lock()
 	pl.n.Advance(rd)
-}
-
-func (pl *asyncApplier) ackCommittedEnts(ents []raftpb.Entry) {
-	for _, e := range ents {
-		switch e.Type {
-		case raftpb.EntryNormal:
-			if len(e.Data) == 0 {
-				continue
-			}
-			ec := proposal.EncProposal(e.Data)
-			pl.pt.Finish(ec.GetID(), true)
-		case raftpb.EntryConfChange:
-		default:
-			panic("unexpected")
-		}
-	}
 }
 
 func (pl *asyncApplier) maybeApplyAsync(ents []raftpb.Entry) {

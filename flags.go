@@ -11,7 +11,7 @@ import (
 	"github.com/nvanbenschoten/rafttoy/peer"
 	"github.com/nvanbenschoten/rafttoy/util"
 	"github.com/spf13/pflag"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 var raftID = pflag.Uint64("id", 1, "ID of this process in the Raft replication group")
@@ -24,8 +24,17 @@ var dataDir = pflag.String("data-dir", "", "Directory to store persistent data")
 var pipelineImpl = pflag.String("pipeline", "basic", "Raft proposal pipeline implementation")
 
 func init() {
+	// Seed rng.
 	rand.Seed(time.Now().UTC().UnixNano())
 
+	// Setup logging.
+	log.SetOutput(os.Stderr)
+	log.SetPrefix("rafttoy | ")
+	log.SetFlags(log.LstdFlags)
+	util.SetRaftLoggingVerbosity(*verbose)
+}
+
+func initFlags() {
 	// Add the set of pflags to Go's flag package so that they are usable
 	// in tests and benchmarks.
 	pflag.CommandLine.VisitAll(func(f *pflag.Flag) {
@@ -42,12 +51,6 @@ func init() {
 	})
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 	pflag.Parse()
-
-	// Setup logging.
-	log.SetOutput(os.Stderr)
-	log.SetPrefix("rafttoy | ")
-	log.SetFlags(log.LstdFlags)
-	util.SetRaftLoggingVerbosity(*verbose)
 }
 
 func cfgFromFlags() peer.Config {

@@ -4,7 +4,7 @@ import (
 	"math"
 
 	"github.com/nvanbenschoten/rafttoy/util/raftentry"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 const cacheByteLimit = 512 << 20 // 512 MB

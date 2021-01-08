@@ -1,6 +1,6 @@
 package wal
 
-import "go.etcd.io/etcd/raft/raftpb"
+import "go.etcd.io/etcd/raft/v3/raftpb"
 
 // Wal represents a write-ahead log to store Raft log entries.
 type Wal interface {

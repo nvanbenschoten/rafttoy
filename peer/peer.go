@@ -14,9 +14,9 @@ import (
 	"github.com/nvanbenschoten/rafttoy/transport"
 	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
 	"github.com/nvanbenschoten/rafttoy/util"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
-	"go.etcd.io/etcd/raft/tracker"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
+	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
 // Peer is a member of a Raft consensus group. Its primary roles are to:

@@ -17,7 +17,7 @@ package raftentry
 import (
 	"math/bits"
 
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // ringBuf is a ring buffer of raft entries.

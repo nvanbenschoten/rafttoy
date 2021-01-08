@@ -7,7 +7,7 @@ import (
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage"
 	"github.com/nvanbenschoten/rafttoy/transport"
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 // basic is a standard proposal pipeline. It mirrors the

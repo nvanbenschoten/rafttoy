@@ -33,7 +33,7 @@ func (pr *Tracker) Finish(id int64, success bool) {
 // FinishAll informs all tracked proposal that they have completed.
 func (pr *Tracker) FinishAll() {
 	for id, c := range pr.m {
-		c <- false
 		delete(pr.m, id)
+		c <- false
 	}
 }

@@ -23,7 +23,7 @@ import (
 	"unsafe"
 
 	"github.com/pkg/errors"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 type rangeID int64

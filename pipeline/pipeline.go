@@ -11,8 +11,8 @@ import (
 	"github.com/nvanbenschoten/rafttoy/storage"
 	"github.com/nvanbenschoten/rafttoy/storage/engine"
 	"github.com/nvanbenschoten/rafttoy/transport"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Pipeline represents an implementation of a Raft proposal pipeline. It manages
@@ -77,6 +77,22 @@ func splitMsgApps(msgs []raftpb.Message) (msgApps, otherMsgs []raftpb.Message) {
 func processSnapshot(sn raftpb.Snapshot) {
 	if !raft.IsEmptySnap(sn) {
 		log.Fatalf("unhandled snapshot %v", sn)
+	}
+}
+
+func ackCommittedEnts(pt *proposal.Tracker, ents []raftpb.Entry) {
+	for _, e := range ents {
+		switch e.Type {
+		case raftpb.EntryNormal:
+			if len(e.Data) == 0 {
+				continue
+			}
+			ec := proposal.EncProposal(e.Data)
+			pt.Finish(ec.GetID(), true)
+		case raftpb.EntryConfChange:
+		default:
+			panic("unexpected")
+		}
 	}
 }
 

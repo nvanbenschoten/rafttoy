@@ -16,7 +16,7 @@ import proto "github.com/gogo/protobuf/proto"
 import fmt "fmt"
 import math "math"
 import _ "github.com/gogo/protobuf/gogoproto"
-import raftpb "go.etcd.io/etcd/raft/raftpb"
+import raftpb "go.etcd.io/etcd/raft/v3/raftpb"
 import config "github.com/nvanbenschoten/rafttoy/config"
 
 import context "golang.org/x/net/context"

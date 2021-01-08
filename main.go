@@ -32,15 +32,15 @@ func newPeer(cfg peer.Config) *peer.Peer {
 	//  WAL.
 	var _ wal.Wal // avoid import thrashing
 	// w := wal.NewMem()
-	// w := engine.NewPebble(*dataDir, false).(wal.Wal)
+	w := engine.NewPebble(*dataDir, false).(wal.Wal)
 	// w := wal.NewEtcdWal(*dataDir)
 	//  Engine.
 	// e := engine.NewMem()
-	// e := engine.NewPebble(*dataDir, false)
+	e := engine.NewPebble(*dataDir, false)
 	// e := engine.NewPebble(*dataDir, true)
 	//  Combined.
-	// s := storage.CombineWalAndEngine(w, e)
-	s := engine.NewPebble(*dataDir, false).(storage.Storage)
+	s := storage.CombineWalAndEngine(w, e)
+	// s := engine.NewPebble(*dataDir, false).(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
@@ -51,7 +51,9 @@ func newPeer(cfg peer.Config) *peer.Peer {
 	case "basic":
 		pl = pipeline.NewBasic()
 	case "parallel-append":
-		pl = pipeline.NewParallelAppender()
+		pl = pipeline.NewParallelAppender(false /* earlyAck */)
+	case "parallel-append-early-ack":
+		pl = pipeline.NewParallelAppender(true /* earlyAck */)
 	case "async-apply":
 		pl = pipeline.NewAsyncApplier(false /* earlyAck */, false /* lazyFollower */)
 	case "async-apply-early-ack":
@@ -66,6 +68,7 @@ func newPeer(cfg peer.Config) *peer.Peer {
 }
 
 func main() {
+	initFlags()
 	servePProf(*pprof)
 	printMetrics := metric.Enable(*recordMetrics)
 	defer printMetrics()

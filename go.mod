@@ -15,15 +15,15 @@ require (
 	github.com/rcrowley/go-metrics v0.0.0-20200313005456-10cdbea86bc0
 	github.com/spf13/pflag v1.0.5
 	github.com/ugorji/go/codec v0.0.0-20190204201341-e444a5086c43 // indirect
-	go.etcd.io/etcd v3.3.25+incompatible
+	go.etcd.io/etcd v0.0.0-20191023171146-3cf2f69b5738 // indirect
+	go.etcd.io/etcd/raft/v3 v3.0.0-20201109164711-01844fd28560
+	go.etcd.io/etcd/server/v3 v3.0.0-20201109164711-01844fd28560
 	go.uber.org/zap v1.16.0
 	golang.org/x/exp v0.0.0-20200901203048-c4f52b2c50aa // indirect
 	golang.org/x/lint v0.0.0-20200302205851-738671d3881b // indirect
-	golang.org/x/net v0.0.0-20200822124328-c89045814202
+	golang.org/x/net v0.0.0-20201006153459-a7d1128ccaa0
 	golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
-	golang.org/x/sys v0.0.0-20200831180312-196b9ba8737a // indirect
 	golang.org/x/text v0.3.3 // indirect
-	golang.org/x/tools v0.0.0-20200903005429-2364a5e8fdcf // indirect
 	google.golang.org/genproto v0.0.0-20200903010400-9bfcb5116336 // indirect
 	google.golang.org/grpc v1.31.1
 	google.golang.org/protobuf v1.25.0 // indirect
@@ -33,3 +33,18 @@ require (
 )
 
 go 1.13
+
+// At the time of writing (i.e. as of this version below) the `etcd` repo is in the process of properly introducing
+// modules, and as part of that uses an unsatisfiable version for this dependency (v3.0.0-00010101000000-000000000000).
+// We just force it to the same SHA as the `go.etcd.io/etcd/raft/v3` module (they live in the same VCS root).
+//
+// While this is necessary, make sure that the require block above does not diverge.
+replace go.etcd.io/etcd/api/v3 => go.etcd.io/etcd/api/v3 v3.0.0-20201109164711-01844fd28560
+
+replace go.etcd.io/etcd/client/v2 => go.etcd.io/etcd/client/v2 v2.0.0-20201109164711-01844fd28560
+
+replace go.etcd.io/etcd/client/v3 => go.etcd.io/etcd/client/v3 v3.0.0-20201109164711-01844fd28560
+
+replace go.etcd.io/etcd/pkg/v3 => go.etcd.io/etcd/pkg/v3 v3.0.0-20201109164711-01844fd28560
+
+replace go.etcd.io/etcd/raft/v3 => go.etcd.io/etcd/raft/v3 v3.0.0-20201109164711-01844fd28560

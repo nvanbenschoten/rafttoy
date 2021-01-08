@@ -9,7 +9,7 @@ import (
 	"github.com/nvanbenschoten/rafttoy/storage/wal"
 	"github.com/nvanbenschoten/rafttoy/util"
 	"github.com/nvanbenschoten/rafttoy/workload"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 func benchmarkWalConfig(b *testing.B, batchSize, bytes int, w wal.Wal) {

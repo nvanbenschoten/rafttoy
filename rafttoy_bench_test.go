@@ -30,6 +30,7 @@ func newEpoch() config.TestEpoch {
 }
 
 func TestMain(m *testing.M) {
+	initFlags()
 	defer metric.Enable(*recordMetrics)()
 	m.Run()
 }

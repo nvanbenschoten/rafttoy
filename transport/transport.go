@@ -3,7 +3,7 @@ package transport
 import (
 	"github.com/nvanbenschoten/rafttoy/config"
 	transpb "github.com/nvanbenschoten/rafttoy/transport/transportpb"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Transport handles RPC messages for Raft coordination.

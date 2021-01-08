@@ -2,7 +2,7 @@ syntax = "proto3";
 package transportpb;
 
 import "gogoproto/gogo.proto";
-import "go.etcd.io/etcd/raft/raftpb/raft.proto";
+import "go.etcd.io/etcd/raft/v3/raftpb/raft.proto";
 import "github.com/nvanbenschoten/rafttoy/config/config.proto";
 
 message RaftMsg {

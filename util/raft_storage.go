@@ -2,8 +2,8 @@ package util
 
 import (
 	"github.com/nvanbenschoten/rafttoy/storage"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 type raftStorageImpl struct {

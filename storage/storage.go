@@ -3,7 +3,7 @@ package storage
 import (
 	"github.com/nvanbenschoten/rafttoy/storage/engine"
 	"github.com/nvanbenschoten/rafttoy/storage/wal"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Storage combines the responsibilities of a Raft log and a storage engine.

@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"go.etcd.io/etcd/raft"
+	"go.etcd.io/etcd/raft/v3"
 )
 
 // SetRaftLoggingVerbosity sets the logger inside etcd/raft.

@@ -1,6 +1,6 @@
 package engine
 
-import "go.etcd.io/etcd/raft/raftpb"
+import "go.etcd.io/etcd/raft/v3/raftpb"
 
 // Engine represents a storage engine that Raft entries are applied to.
 type Engine interface {

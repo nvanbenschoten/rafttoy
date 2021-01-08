@@ -11,8 +11,8 @@ import (
 	pdb "github.com/cockroachdb/pebble"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage/wal"
-	"go.etcd.io/etcd/raft"
-	"go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/v3"
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 const dirPrefix = "pebble-data"
