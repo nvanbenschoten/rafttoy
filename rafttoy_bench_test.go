@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,20 +65,24 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 	b.ResetTimer()
 	b.SetBytes(int64(bytes))
 	var g errgroup.Group
-	defer g.Wait()
+	var aggDur int64
 	for i := range workers {
 		worker := workers[i]
 		g.Go(func() error {
 			c := make(chan bool, 1)
+			start := time.Now()
 			for prop := worker.NextProposal(); prop != nil; prop = worker.NextProposal() {
 				if !p.ProposeWith(prop, c) {
 					return errors.New("proposal failed")
 				}
 			}
+			dur := time.Since(start).Nanoseconds()
+			atomic.AddInt64(&aggDur, dur)
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
 		b.Fatal(err)
 	}
+	b.ReportMetric(float64(aggDur)/float64(b.N), "ns/op")
 }
