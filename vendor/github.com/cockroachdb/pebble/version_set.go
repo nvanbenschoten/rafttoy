@@ -36,6 +36,27 @@ type versionList = manifest.VersionList
 // like it sounds: a delta from the previous version. Version edits are logged
 // to the MANIFEST file, which is replayed at startup.
 type versionSet struct {
+	// WARNING: The following struct `atomic` contains fields are accessed atomically.
+	//
+	// Go allocations are guaranteed to be 64-bit aligned which we take advantage
+	// of by placing the 64-bit fields which we access atomically at the beginning
+	// of the versionSet struct.
+	// For more information, see https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
+	atomic struct {
+		logSeqNum uint64 // next seqNum to use for WAL writes
+
+		// The upper bound on sequence numbers that have been assigned so far.
+		// A suffix of these sequence numbers may not have been written to a
+		// WAL. Both logSeqNum and visibleSeqNum are atomically updated by the
+		// commitPipeline.
+		visibleSeqNum uint64 // visible seqNum (<= logSeqNum)
+
+		// Number of bytes present in sstables being written by in-progress
+		// compactions. This value will be zero if there are no in-progress
+		// compactions. Updated and read atomically.
+		atomicInProgressBytes int64
+	}
+
 	// Immutable fields.
 	dirname string
 	// Set to DB.mu.
@@ -56,8 +77,8 @@ type versionSet struct {
 
 	// A pointer to versionSet.addObsoleteLocked. Avoids allocating a new closure
 	// on the creation of every version.
-	obsoleteFn        func(obsolete []FileNum)
-	obsoleteTables    []FileNum
+	obsoleteFn        func(obsolete []*manifest.FileMetadata)
+	obsoleteTables    []*manifest.FileMetadata
 	obsoleteManifests []FileNum
 	obsoleteOptions   []FileNum
 
@@ -72,13 +93,6 @@ type versionSet struct {
 	// The next file number. A single counter is used to assign file numbers
 	// for the WAL, MANIFEST, sstable, and OPTIONS files.
 	nextFileNum FileNum
-
-	// The upper bound on sequence numbers that have been assigned so far.
-	// A suffix of these sequence numbers may not have been written to a
-	// WAL. Both logSeqNum and visibleSeqNum are atomically updated by the
-	// commitPipeline.
-	logSeqNum     uint64 // next seqNum to use for WAL writes
-	visibleSeqNum uint64 // visible seqNum (<= logSeqNum)
 
 	// The current manifest file number.
 	manifestFileNum FileNum
@@ -112,7 +126,7 @@ func (vs *versionSet) create(
 	vs.init(dirname, opts, mu)
 	newVersion := &version{}
 	vs.append(newVersion)
-	vs.picker = newCompactionPicker(newVersion, vs.opts, nil)
+	vs.picker = newCompactionPicker(newVersion, vs.opts, nil, vs.metrics.levelSizes())
 
 	// Note that a "snapshot" version edit is written to the manifest when it is
 	// created.
@@ -189,6 +203,7 @@ func (vs *versionSet) load(dirname string, opts *Options, mu *sync.Mutex) error 
 
 	// Read the versionEdits in the manifest file.
 	var bve bulkVersionEdit
+	bve.AddedByFileNum = make(map[base.FileNum]*fileMetadata)
 	manifest, err := vs.fs.Open(vs.fs.PathJoin(dirname, string(b)))
 	if err != nil {
 		return errors.Wrapf(err, "pebble: could not open manifest file %q for DB %q",
@@ -239,7 +254,7 @@ func (vs *versionSet) load(dirname string, opts *Options, mu *sync.Mutex) error 
 			// (assuming no WALs contain higher sequence numbers than the
 			// manifest's LastSeqNum). Increment LastSeqNum by 1 to get the
 			// next sequence number that will be assigned.
-			vs.logSeqNum = ve.LastSeqNum + 1
+			vs.atomic.logSeqNum = ve.LastSeqNum + 1
 		}
 	}
 	// We have already set vs.nextFileNum = 2 at the beginning of the
@@ -259,20 +274,20 @@ func (vs *versionSet) load(dirname string, opts *Options, mu *sync.Mutex) error 
 	}
 	vs.markFileNumUsed(vs.minUnflushedLogNum)
 
-	newVersion, _, err := bve.Apply(nil, vs.cmp, opts.Comparer.FormatKey, opts.Experimental.FlushSplitBytes)
+	newVersion, _, err := bve.Apply(nil, vs.cmp, opts.Comparer.FormatKey, opts.FlushSplitBytes, opts.Experimental.ReadCompactionRate)
 	if err != nil {
 		return err
 	}
-	newVersion.L0Sublevels.InitCompactingFileInfo()
+	newVersion.L0Sublevels.InitCompactingFileInfo(nil /* in-progress compactions */)
 	vs.append(newVersion)
-
-	vs.picker = newCompactionPicker(newVersion, vs.opts, nil)
 
 	for i := range vs.metrics.Levels {
 		l := &vs.metrics.Levels[i]
-		l.NumFiles = int64(newVersion.Levels[i].Slice().Len())
-		l.Size = int64(newVersion.Levels[i].Slice().SizeSum())
+		l.NumFiles = int64(newVersion.Levels[i].Len())
+		files := newVersion.Levels[i].Slice()
+		l.Size = int64(files.SizeSum())
 	}
+	vs.picker = newCompactionPicker(newVersion, vs.opts, nil, vs.metrics.levelSizes())
 	return nil
 }
 
@@ -358,7 +373,7 @@ func (vs *versionSet) logAndApply(
 	// in an unflushed memtable. logSeqNum is the _next_ sequence number that
 	// will be assigned, so subtract that by 1 to get the upper bound on the
 	// last assigned sequence number.
-	logSeqNum := atomic.LoadUint64(&vs.logSeqNum)
+	logSeqNum := atomic.LoadUint64(&vs.atomic.logSeqNum)
 	ve.LastSeqNum = logSeqNum - 1
 	if logSeqNum == 0 {
 		// logSeqNum is initialized to 1 in Open() if there are no previous WAL
@@ -392,7 +407,7 @@ func (vs *versionSet) logAndApply(
 		}
 
 		var err error
-		newVersion, zombies, err = bve.Apply(currentVersion, vs.cmp, vs.opts.Comparer.FormatKey, vs.opts.Experimental.FlushSplitBytes)
+		newVersion, zombies, err = bve.Apply(currentVersion, vs.cmp, vs.opts.Comparer.FormatKey, vs.opts.FlushSplitBytes, vs.opts.Experimental.ReadCompactionRate)
 		if err != nil {
 			return err
 		}
@@ -452,7 +467,9 @@ func (vs *versionSet) logAndApply(
 
 	// Now that DB.mu is held again, initialize compacting file info in
 	// L0Sublevels.
-	newVersion.L0Sublevels.InitCompactingFileInfo()
+	inProgress := inProgressCompactions()
+
+	newVersion.L0Sublevels.InitCompactingFileInfo(inProgressL0Compactions(inProgress))
 
 	// Update the zombie tables set first, as installation of the new version
 	// will unref the previous version which could result in addObsoleteLocked
@@ -472,10 +489,6 @@ func (vs *versionSet) logAndApply(
 		}
 		vs.manifestFileNum = newManifestFileNum
 	}
-	vs.picker = newCompactionPicker(newVersion, vs.opts, inProgressCompactions())
-	if !vs.dynamicBaseLevel {
-		vs.picker.forceBaseLevel1()
-	}
 
 	for level, update := range metrics {
 		vs.metrics.Levels[level].Add(update)
@@ -487,15 +500,22 @@ func (vs *versionSet) logAndApply(
 			l.Sublevels = 1
 		}
 		if invariants.Enabled {
-			if count := int64(newVersion.Levels[i].Slice().Len()); l.NumFiles != count {
+			if count := int64(newVersion.Levels[i].Len()); l.NumFiles != count {
 				vs.opts.Logger.Fatalf("versionSet metrics L%d NumFiles = %d, actual count = %d", i, l.NumFiles, count)
 			}
-			if size := int64(newVersion.Levels[i].Slice().SizeSum()); l.Size != size {
+			levelFiles := newVersion.Levels[i].Slice()
+			if size := int64(levelFiles.SizeSum()); l.Size != size {
 				vs.opts.Logger.Fatalf("versionSet metrics L%d Size = %d, actual size = %d", i, l.Size, size)
 			}
 		}
 	}
 	vs.metrics.Levels[0].Sublevels = int32(len(newVersion.L0Sublevels.Levels))
+
+	vs.picker = newCompactionPicker(newVersion, vs.opts, inProgress, vs.metrics.levelSizes())
+	if !vs.dynamicBaseLevel {
+		vs.picker.forceBaseLevel1()
+	}
+
 	return nil
 }
 
@@ -505,6 +525,10 @@ func (vs *versionSet) incrementCompactions() {
 
 func (vs *versionSet) incrementFlushes() {
 	vs.metrics.Flush.Count++
+}
+
+func (vs *versionSet) incrementCompactionBytes(numBytes int64) {
+	atomic.AddInt64(&vs.atomic.atomicInProgressBytes, numBytes)
 }
 
 // createManifest creates a manifest file that contains a snapshot of vs.
@@ -622,16 +646,24 @@ func (vs *versionSet) addLiveFileNums(m map[FileNum]struct{}) {
 	}
 }
 
-func (vs *versionSet) addObsoleteLocked(obsolete []FileNum) {
-	for _, fileNum := range obsolete {
+func (vs *versionSet) addObsoleteLocked(obsolete []*manifest.FileMetadata) {
+	for _, fileMeta := range obsolete {
 		// Note that the obsolete tables are no longer zombie by the definition of
 		// zombie, but we leave them in the zombie tables map until they are
 		// deleted from disk.
-		if _, ok := vs.zombieTables[fileNum]; !ok {
-			vs.opts.Logger.Fatalf("MANIFEST obsolete table %s not marked as zombie", fileNum)
+		if _, ok := vs.zombieTables[fileMeta.FileNum]; !ok {
+			vs.opts.Logger.Fatalf("MANIFEST obsolete table %s not marked as zombie", fileMeta.FileNum)
 		}
 	}
 	vs.obsoleteTables = append(vs.obsoleteTables, obsolete...)
+	vs.incrementObsoleteTablesLocked(obsolete)
+}
+
+func (vs *versionSet) incrementObsoleteTablesLocked(obsolete []*manifest.FileMetadata) {
+	for _, fileMeta := range obsolete {
+		vs.metrics.Table.ObsoleteCount++
+		vs.metrics.Table.ObsoleteSize += fileMeta.Size
+	}
 }
 
 func newFileMetrics(newFiles []manifest.NewFileEntry) map[int]*LevelMetrics {

@@ -187,7 +187,13 @@ type Batch struct {
 	formatKey      base.FormatKey
 	abbreviatedKey AbbreviatedKey
 
-	memTableSize uint32
+	// An upper bound on required space to add this batch to a memtable.
+	// Note that although batches are limited to 4 GiB in size, that limit
+	// applies to len(data), not the memtable size. The upper bound on the
+	// size of a memtable node is larger than the overhead of the batch's log
+	// encoding, so memTableSize is larger than len(data) and may overflow a
+	// uint32.
+	memTableSize uint64
 
 	// The db to which the batch will be committed. Do not change this field
 	// after the batch has been created as it might invalidate internal state.
@@ -666,8 +672,7 @@ func (b *Batch) NewIter(o *IterOptions) *Iterator {
 	if b.index == nil {
 		return &Iterator{err: ErrNotIndexed}
 	}
-	return b.db.newIterInternal(b.newInternalIter(o),
-		b.newRangeDelIter(o), nil /* snapshot */, o)
+	return b.db.newIterInternal(b, nil /* snapshot */, o)
 }
 
 // newInternalIter creates a new internalIterator that iterates over the
@@ -798,7 +803,7 @@ func (b *Batch) countData() []byte {
 
 func (b *Batch) grow(n int) {
 	newSize := len(b.data) + n
-	if newSize >= maxBatchSize {
+	if uint64(newSize) >= maxBatchSize {
 		panic(ErrBatchTooLarge)
 	}
 	if newSize > cap(b.data) {
@@ -819,8 +824,11 @@ func (b *Batch) setSeqNum(seqNum uint64) {
 
 // SeqNum returns the batch sequence number which is applied to the first
 // record in the batch. The sequence number is incremented for each subsequent
-// record.
+// record. It returns zero if the batch is empty.
 func (b *Batch) SeqNum() uint64 {
+	if len(b.data) == 0 {
+		b.init(batchHeaderLen)
+	}
 	return binary.LittleEndian.Uint64(b.seqNumData())
 }
 
@@ -840,6 +848,9 @@ func (b *Batch) Count() uint32 {
 // Reader returns a BatchReader for the current batch contents. If the batch is
 // mutated, the new entries will not be visible to the reader.
 func (b *Batch) Reader() BatchReader {
+	if len(b.data) == 0 {
+		b.init(batchHeaderLen)
+	}
 	return b.data[batchHeaderLen:]
 }
 
@@ -878,6 +889,9 @@ type BatchReader []byte
 // MakeBatchReader constructs a BatchReader from a batch representation. The
 // header (containing the batch count and seqnum) is ignored.
 func MakeBatchReader(repr []byte) BatchReader {
+	if len(repr) <= batchHeaderLen {
+		return nil
+	}
 	return repr[batchHeaderLen:]
 }
 

@@ -160,6 +160,33 @@ type Writer interface {
 //		Comparer: myComparer,
 //	})
 type DB struct {
+	// WARNING: The following struct `atomic` contains fields which are accessed
+	// atomically.
+	//
+	// Go allocations are guaranteed to be 64-bit aligned which we take advantage
+	// of by placing the 64-bit fields which we access atomically at the beginning
+	// of the DB struct. For more information, see https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
+	atomic struct {
+		// The count and size of referenced memtables. This includes memtables
+		// present in DB.mu.mem.queue, as well as memtables that have been flushed
+		// but are still referenced by an inuse readState.
+		memTableCount    int64
+		memTableReserved int64 // number of bytes reserved in the cache for memtables
+
+		// bytesFlushed is the number of bytes flushed in the current flush. This
+		// must be read/written atomically since it is accessed by both the flush
+		// and compaction routines.
+		bytesFlushed uint64
+
+		// bytesCompacted is the number of bytes compacted in the current compaction.
+		// This is used as a dummy variable to increment during compaction, and the
+		// value is not used anywhere.
+		bytesCompacted uint64
+
+		// The size of the current log file (i.e. db.mu.log.queue[len(queue)-1].
+		logSize uint64
+	}
+
 	cacheID        uint64
 	dirname        string
 	walDirname     string
@@ -190,7 +217,6 @@ type DB struct {
 		sync.RWMutex
 		val *readState
 	}
-
 	// logRecycler holds a set of log file numbers that are available for
 	// reuse. Writing to a recycled log file is faster than to a new log file on
 	// some common filesystems (xfs, and ext3/4) due to avoiding metadata
@@ -200,24 +226,9 @@ type DB struct {
 	closed   atomic.Value
 	closedCh chan struct{}
 
-	// The count and size of referenced memtables. This includes memtables
-	// present in DB.mu.mem.queue, as well as memtables that have been flushed
-	// but are still referenced by an inuse readState.
-	memTableCount    int64
-	memTableReserved int64 // number of bytes reserved in the cache for memtables
-
 	compactionLimiter limiter
-
-	// bytesFlushed is the number of bytes flushed in the current flush. This
-	// must be read/written atomically since it is accessed by both the flush
-	// and compaction routines.
-	bytesFlushed uint64
-	// bytesCompacted is the number of bytes compacted in the current compaction.
-	// This is used as a dummy variable to increment during compaction, and the
-	// value is not used anywhere.
-	bytesCompacted uint64
-
-	flushLimiter limiter
+	flushLimiter      limiter
+	deletionLimiter   limiter
 
 	// The main mutex protecting internal DB state. This mutex encompasses many
 	// fields because those fields need to be accessed and updated atomically. In
@@ -239,8 +250,9 @@ type DB struct {
 		nextJobID int
 
 		// The collection of immutable versions and state about the log and visible
-		// sequence numbers.
-		versions versionSet
+		// sequence numbers. Use the pointer here to ensure the atomic fields in
+		// version set are aligned properly.
+		versions *versionSet
 
 		log struct {
 			// The queue of logs, containing both flushed and unflushed logs. The
@@ -248,8 +260,6 @@ type DB struct {
 			// delimeter between flushed and unflushed logs is
 			// versionSet.minUnflushedLogNum.
 			queue []FileNum
-			// The size of the current log file (i.e. queue[len(queue)-1].
-			size uint64
 			// The number of input bytes to the log. This is the raw size of the
 			// batches written to the WAL, without the overhead of the record
 			// envelopes.
@@ -300,6 +310,9 @@ type DB struct {
 			manual []*manualCompaction
 			// inProgress is the set of in-progress flushes and compactions.
 			inProgress map[*compaction]struct{}
+			// readCompactions is a list of read triggered compactions. The next
+			// compaction to perform is as the start. New entries are added to the end.
+			readCompactions []readCompaction
 		}
 
 		cleaner struct {
@@ -372,7 +385,7 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 	if s != nil {
 		seqNum = s.seqNum
 	} else {
-		seqNum = atomic.LoadUint64(&d.mu.versions.visibleSeqNum)
+		seqNum = atomic.LoadUint64(&d.mu.versions.atomic.visibleSeqNum)
 	}
 
 	var buf struct {
@@ -644,7 +657,7 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 		}
 	}
 
-	atomic.StoreUint64(&d.mu.log.size, uint64(size))
+	atomic.StoreUint64(&d.atomic.logSize, uint64(size))
 	return mem, err
 }
 
@@ -662,11 +675,9 @@ var iterAllocPool = sync.Pool{
 	},
 }
 
-// newIterInternal constructs a new iterator, merging in batchIter as an extra
+// newIterInternal constructs a new iterator, merging in batch iterators as an extra
 // level.
-func (d *DB) newIterInternal(
-	batchIter internalIterator, batchRangeDelIter internalIterator, s *Snapshot, o *IterOptions,
-) *Iterator {
+func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterator {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -682,7 +693,7 @@ func (d *DB) newIterInternal(
 	if s != nil {
 		seqNum = s.seqNum
 	} else {
-		seqNum = atomic.LoadUint64(&d.mu.versions.visibleSeqNum)
+		seqNum = atomic.LoadUint64(&d.mu.versions.atomic.visibleSeqNum)
 	}
 
 	// Bundle various structures under a single umbrella in order to allocate
@@ -698,20 +709,38 @@ func (d *DB) newIterInternal(
 		split:     d.split,
 		readState: readState,
 		keyBuf:    buf.keyBuf,
+		batch:     batch,
+		newIters:  d.newIters,
+		seqNum:    seqNum,
 	}
 	if o != nil {
 		dbi.opts = *o
 	}
 	dbi.opts.logger = d.opts.Logger
+	return finishInitializingIter(buf)
+}
 
+// finishInitializingIter is a helper for doing the non-trivial initialization
+// of an Iterator.
+func finishInitializingIter(buf *iterAlloc) *Iterator {
+	// Short-hand.
+	dbi := &buf.dbi
+	readState := dbi.readState
+	batch := dbi.batch
+	seqNum := dbi.seqNum
+
+	// Merging levels.
 	mlevels := buf.mlevels[:0]
-	if batchIter != nil {
+
+	// Top-level is the batch, if any.
+	if batch != nil {
 		mlevels = append(mlevels, mergingIterLevel{
-			iter:         batchIter,
-			rangeDelIter: batchRangeDelIter,
+			iter:         batch.newInternalIter(&dbi.opts),
+			rangeDelIter: batch.newRangeDelIter(&dbi.opts),
 		})
 	}
 
+	// Next are the memtables.
 	memtables := readState.memtables
 	for i := len(memtables) - 1; i >= 0; i-- {
 		mem := memtables[i]
@@ -726,18 +755,18 @@ func (d *DB) newIterInternal(
 		})
 	}
 
+	// Next are the file levels: L0 sub-levels followed by lower levels.
+
 	// Determine the final size for mlevels so that we can avoid any more
 	// reallocations. This is important because each levelIter will hold a
 	// reference to elements in mlevels.
 	start := len(mlevels)
 	current := readState.current
 	for sl := 0; sl < len(current.L0Sublevels.Levels); sl++ {
-		if len(current.L0Sublevels.Levels[sl]) > 0 {
-			mlevels = append(mlevels, mergingIterLevel{})
-		}
+		mlevels = append(mlevels, mergingIterLevel{})
 	}
 	for level := 1; level < len(current.Levels); level++ {
-		if current.Levels[level].Iter().Empty() {
+		if current.Levels[level].Empty() {
 			continue
 		}
 		mlevels = append(mlevels, mergingIterLevel{})
@@ -747,9 +776,6 @@ func (d *DB) newIterInternal(
 
 	levels := buf.levels[:]
 	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
-		if files.Empty() {
-			return
-		}
 		var li *levelIter
 		if len(levels) > 0 {
 			li = &levels[0]
@@ -758,10 +784,11 @@ func (d *DB) newIterInternal(
 			li = &levelIter{}
 		}
 
-		li.init(dbi.opts, d.cmp, d.newIters, files, level, nil)
+		li.init(dbi.opts, dbi.cmp, dbi.newIters, files, level, nil)
 		li.initRangeDel(&mlevels[0].rangeDelIter)
 		li.initSmallestLargestUserKey(&mlevels[0].smallestUserKey, &mlevels[0].largestUserKey,
 			&mlevels[0].isLargestUserKeyRangeDelSentinel)
+		li.initIsSyntheticIterBoundsKey(&mlevels[0].isSyntheticIterBoundsKey)
 		mlevels[0].iter = li
 		mlevels = mlevels[1:]
 	}
@@ -769,16 +796,18 @@ func (d *DB) newIterInternal(
 	// Add level iterators for the L0 sublevels, iterating from newest to
 	// oldest.
 	for i := len(current.L0Sublevels.Levels) - 1; i >= 0; i-- {
-		iter := manifest.NewLevelSlice(current.L0Sublevels.Levels[i]).Iter()
-		addLevelIterForFiles(iter, manifest.L0Sublevel(i))
+		addLevelIterForFiles(current.L0Sublevels.Levels[i].Iter(), manifest.L0Sublevel(i))
 	}
 
 	// Add level iterators for the non-empty non-L0 levels.
 	for level := 1; level < len(current.Levels); level++ {
+		if current.Levels[level].Empty() {
+			continue
+		}
 		addLevelIterForFiles(current.Levels[level].Iter(), manifest.Level(level))
 	}
 
-	buf.merging.init(&dbi.opts, d.cmp, finalMLevels...)
+	buf.merging.init(&dbi.opts, dbi.cmp, finalMLevels...)
 	buf.merging.snapshot = seqNum
 	buf.merging.elideRangeTombstones = true
 	return dbi
@@ -808,8 +837,7 @@ func (d *DB) NewIndexedBatch() *Batch {
 // apparent memory and disk usage leak. Use snapshots (see NewSnapshot) for
 // point-in-time snapshots which avoids these problems.
 func (d *DB) NewIter(o *IterOptions) *Iterator {
-	return d.newIterInternal(nil, /* batchIter */
-		nil /* batchRangeDelIter */, nil /* snapshot */, o)
+	return d.newIterInternal(nil /* batch */, nil /* snapshot */, o)
 }
 
 // NewSnapshot returns a point-in-time view of the current DB state. Iterators
@@ -828,7 +856,7 @@ func (d *DB) NewSnapshot() *Snapshot {
 	d.mu.Lock()
 	s := &Snapshot{
 		db:     d,
-		seqNum: atomic.LoadUint64(&d.mu.versions.visibleSeqNum),
+		seqNum: atomic.LoadUint64(&d.mu.versions.atomic.visibleSeqNum),
 	}
 	d.mu.snapshots.pushBack(s)
 	d.mu.Unlock()
@@ -899,7 +927,7 @@ func (d *DB) Close() error {
 		for _, mem := range d.mu.mem.queue {
 			mem.readerUnref()
 		}
-		if reserved := atomic.LoadInt64(&d.memTableReserved); reserved != 0 {
+		if reserved := atomic.LoadInt64(&d.atomic.memTableReserved); reserved != 0 {
 			return errors.Errorf("leaked memtable reservation: %d", errors.Safe(reserved))
 		}
 	}
@@ -927,16 +955,20 @@ func (d *DB) Compact(
 	if d.opts.ReadOnly {
 		return ErrReadOnly
 	}
-
+	if d.cmp(start, end) >= 0 {
+		return errors.Errorf("Compact start %s is not less than end %s",
+			d.opts.Comparer.FormatKey(start), d.opts.Comparer.FormatKey(end))
+	}
 	iStart := base.MakeInternalKey(start, InternalKeySeqNumMax, InternalKeyKindMax)
 	iEnd := base.MakeInternalKey(end, 0, 0)
-	meta := []*fileMetadata{&fileMetadata{Smallest: iStart, Largest: iEnd}}
+	meta := []*fileMetadata{{Smallest: iStart, Largest: iEnd}}
 
 	d.mu.Lock()
 	maxLevelWithFiles := 1
 	cur := d.mu.versions.currentVersion()
 	for level := 0; level < numLevels; level++ {
-		if !cur.Overlaps(level, d.cmp, start, end).Empty() {
+		overlaps := cur.Overlaps(level, d.cmp, start, end)
+		if !overlaps.Empty() {
 			maxLevelWithFiles = level + 1
 		}
 	}
@@ -1052,14 +1084,15 @@ func (d *DB) Metrics() *Metrics {
 	d.mu.Lock()
 	*metrics = d.mu.versions.metrics
 	metrics.Compact.EstimatedDebt = d.mu.versions.picker.estimatedCompactionDebt(0)
+	metrics.Compact.InProgressBytes = atomic.LoadInt64(&d.mu.versions.atomic.atomicInProgressBytes)
 	for _, m := range d.mu.mem.queue {
 		metrics.MemTable.Size += m.totalBytes()
 	}
 	metrics.MemTable.Count = int64(len(d.mu.mem.queue))
-	metrics.MemTable.ZombieCount = atomic.LoadInt64(&d.memTableCount) - metrics.MemTable.Count
-	metrics.MemTable.ZombieSize = uint64(atomic.LoadInt64(&d.memTableReserved)) - metrics.MemTable.Size
+	metrics.MemTable.ZombieCount = atomic.LoadInt64(&d.atomic.memTableCount) - metrics.MemTable.Count
+	metrics.MemTable.ZombieSize = uint64(atomic.LoadInt64(&d.atomic.memTableReserved)) - metrics.MemTable.Size
 	metrics.WAL.ObsoleteFiles = int64(recycledLogs)
-	metrics.WAL.Size = atomic.LoadUint64(&d.mu.log.size)
+	metrics.WAL.Size = atomic.LoadUint64(&d.atomic.logSize)
 	metrics.WAL.BytesIn = d.mu.log.bytesIn // protected by d.mu
 	for i, n := 0, len(d.mu.mem.queue)-1; i < n; i++ {
 		metrics.WAL.Size += d.mu.mem.queue[i].logSize
@@ -1083,11 +1116,43 @@ func (d *DB) Metrics() *Metrics {
 	return metrics
 }
 
+// sstablesOptions hold the optional parameters to retrieve TableInfo for all sstables.
+type sstablesOptions struct {
+	// set to true will return the sstable properties in TableInfo
+	withProperties bool
+}
+
+// SSTablesOption set optional parameter used by `DB.SSTables`.
+type SSTablesOption func(*sstablesOptions)
+
+// WithProperties enable return sstable properties in each TableInfo.
+//
+// NOTE: if most of the sstable properties need to be read from disk,
+// this options may make method `SSTables` quite slow.
+func WithProperties() SSTablesOption {
+	return func(opt *sstablesOptions) {
+		opt.withProperties = true
+	}
+}
+
+// SSTableInfo export manifest.TableInfo with sstable.Properties
+type SSTableInfo struct {
+	manifest.TableInfo
+
+	// Properties is the sstable properties of this table.
+	Properties *sstable.Properties
+}
+
 // SSTables retrieves the current sstables. The returned slice is indexed by
 // level and each level is indexed by the position of the sstable within the
 // level. Note that this information may be out of date due to concurrent
 // flushes and compactions.
-func (d *DB) SSTables() [][]TableInfo {
+func (d *DB) SSTables(opts ...SSTablesOption) ([][]SSTableInfo, error) {
+	opt := &sstablesOptions{}
+	for _, fn := range opts {
+		fn(opt)
+	}
+
 	// Grab and reference the current readState.
 	readState := d.loadReadState()
 	defer readState.unref()
@@ -1099,24 +1164,29 @@ func (d *DB) SSTables() [][]TableInfo {
 	srcLevels := readState.current.Levels
 	var totalTables int
 	for i := range srcLevels {
-		// TODO(jackson): Use metrics on the LevelMetadata once available
-		// rather than Slice().Len().
-		totalTables += srcLevels[i].Slice().Len()
+		totalTables += srcLevels[i].Len()
 	}
 
-	destTables := make([]TableInfo, totalTables)
-	destLevels := make([][]TableInfo, len(srcLevels))
+	destTables := make([]SSTableInfo, totalTables)
+	destLevels := make([][]SSTableInfo, len(srcLevels))
 	for i := range destLevels {
 		iter := srcLevels[i].Iter()
 		j := 0
 		for m := iter.First(); m != nil; m = iter.Next() {
-			destTables[j] = m.TableInfo()
+			destTables[j] = SSTableInfo{TableInfo: m.TableInfo()}
+			if opt.withProperties {
+				p, err := d.tableCache.getTableProperties(m)
+				if err != nil {
+					return nil, err
+				}
+				destTables[j].Properties = p
+			}
 			j++
 		}
 		destLevels[i] = destTables[:j]
 		destTables = destTables[j:]
 	}
-	return destLevels
+	return destLevels, nil
 }
 
 // EstimateDiskUsage returns the estimated filesystem space used in bytes for
@@ -1151,7 +1221,8 @@ func (d *DB) EstimateDiskUsage(start, end []byte) (uint64, error) {
 			// We can only use `Overlaps` to restrict `files` at L1+ since at L0 it
 			// expands the range iteratively until it has found a set of files that
 			// do not overlap any other L0 files outside that set.
-			iter = readState.current.Overlaps(level, d.opts.Comparer.Compare, start, end).Iter()
+			overlaps := readState.current.Overlaps(level, d.opts.Comparer.Compare, start, end)
+			iter = overlaps.Iter()
 		}
 		for file := iter.First(); file != nil; file = iter.Next() {
 			if d.opts.Comparer.Compare(start, file.Smallest.UserKey) <= 0 &&
@@ -1199,8 +1270,8 @@ func (d *DB) newMemTable(logNum FileNum, logSeqNum uint64) (*memTable, *flushabl
 		}
 	}
 
-	atomic.AddInt64(&d.memTableCount, 1)
-	atomic.AddInt64(&d.memTableReserved, int64(size))
+	atomic.AddInt64(&d.atomic.memTableCount, 1)
+	atomic.AddInt64(&d.atomic.memTableReserved, int64(size))
 	releaseAccountingReservation := d.opts.Cache.Reserve(size)
 
 	mem := newMemTable(memTableOptions{
@@ -1216,8 +1287,8 @@ func (d *DB) newMemTable(logNum FileNum, logSeqNum uint64) (*memTable, *flushabl
 	entry.releaseMemAccounting = func() {
 		manual.Free(mem.arenaBuf)
 		mem.arenaBuf = nil
-		atomic.AddInt64(&d.memTableCount, -1)
-		atomic.AddInt64(&d.memTableReserved, -int64(size))
+		atomic.AddInt64(&d.atomic.memTableCount, -1)
+		atomic.AddInt64(&d.atomic.memTableReserved, -int64(size))
 		releaseAccountingReservation()
 	}
 	return mem, entry
@@ -1254,14 +1325,12 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			err := d.mu.mem.mutable.prepare(b)
 			if err != arenaskl.ErrArenaFull {
 				if stalled {
-					stalled = false
 					d.opts.EventListener.WriteStallEnd()
 				}
 				return err
 			}
 		} else if !force {
 			if stalled {
-				stalled = false
 				d.opts.EventListener.WriteStallEnd()
 			}
 			return nil
@@ -1285,12 +1354,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				continue
 			}
 		}
-		var l0ReadAmp int
-		if d.opts.Experimental.L0SublevelCompactions {
-			l0ReadAmp = d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
-		} else {
-			l0ReadAmp = d.mu.versions.currentVersion().Levels[0].Slice().Len()
-		}
+		l0ReadAmp := d.mu.versions.currentVersion().L0Sublevels.ReadAmplification()
 		if l0ReadAmp >= d.opts.L0StopWritesThreshold {
 			// There are too many level-0 files, so we wait.
 			if !stalled {
@@ -1315,6 +1379,14 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			d.mu.mem.switching = true
 			d.mu.Unlock()
 
+			// Close the previous log first. This writes an EOF trailer
+			// signifying the end of the file and syncs it to disk. We must
+			// close the previous log before linking the new log file,
+			// otherwise a crash could leave both logs with unclean tails, and
+			// Open will treat the previous log as corrupt.
+			prevLogSize = uint64(d.mu.log.Size())
+			err = d.mu.log.Close()
+
 			newLogName := base.MakeFilename(d.opts.FS, d.walDirname, fileTypeLog, newLogNum)
 
 			// Try to use a recycled log file. Recycling log files is an important
@@ -1323,12 +1395,17 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			// time. This is due to the need to sync file metadata when a file is
 			// being written for the first time. Note this is true even if file
 			// preallocation is performed (e.g. fallocate).
-			recycleLogNum := d.logRecycler.peek()
-			if recycleLogNum > 0 {
-				recycleLogName := base.MakeFilename(d.opts.FS, d.walDirname, fileTypeLog, recycleLogNum)
-				newLogFile, err = d.opts.FS.ReuseForWrite(recycleLogName, newLogName)
-			} else {
-				newLogFile, err = d.opts.FS.Create(newLogName)
+			var recycleLogNum base.FileNum
+			if err == nil {
+				recycleLogNum = d.logRecycler.peek()
+				if recycleLogNum > 0 {
+					recycleLogName := base.MakeFilename(d.opts.FS, d.walDirname, fileTypeLog, recycleLogNum)
+					newLogFile, err = d.opts.FS.ReuseForWrite(recycleLogName, newLogName)
+					base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
+				} else {
+					newLogFile, err = d.opts.FS.Create(newLogName)
+					base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
+				}
 			}
 
 			if err == nil {
@@ -1337,17 +1414,13 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				err = d.walDir.Sync()
 			}
 
-			if err == nil {
-				prevLogSize = uint64(d.mu.log.Size())
-				err = d.mu.log.Close()
-				if err != nil {
-					newLogFile.Close()
-				} else {
-					newLogFile = vfs.NewSyncingFile(newLogFile, vfs.SyncingFileOptions{
-						BytesPerSync:    d.opts.BytesPerSync,
-						PreallocateSize: d.walPreallocateSize(),
-					})
-				}
+			if err != nil && newLogFile != nil {
+				newLogFile.Close()
+			} else if err == nil {
+				newLogFile = vfs.NewSyncingFile(newLogFile, vfs.SyncingFileOptions{
+					BytesPerSync:    d.opts.WALBytesPerSync,
+					PreallocateSize: d.walPreallocateSize(),
+				})
 			}
 
 			if recycleLogNum > 0 {
@@ -1424,7 +1497,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				logSeqNum += uint64(b.Count())
 			}
 		} else {
-			logSeqNum = atomic.LoadUint64(&d.mu.versions.logSeqNum)
+			logSeqNum = atomic.LoadUint64(&d.mu.versions.atomic.logSeqNum)
 		}
 
 		// Create a new memtable, scheduling the previous one for flushing. We do
@@ -1467,6 +1540,8 @@ func (d *DB) getInProgressCompactionInfoLocked(finishing *compaction) (rv []comp
 		if len(c.flushing) == 0 && (finishing == nil || c != finishing) {
 			info := compactionInfo{
 				inputs:      c.inputs,
+				smallest:    c.smallest,
+				largest:     c.largest,
 				outputLevel: -1,
 			}
 			if c.outputLevel != nil {
@@ -1476,6 +1551,25 @@ func (d *DB) getInProgressCompactionInfoLocked(finishing *compaction) (rv []comp
 		}
 	}
 	return
+}
+
+func inProgressL0Compactions(inProgress []compactionInfo) []manifest.L0Compaction {
+	var compactions []manifest.L0Compaction
+	for _, info := range inProgress {
+		l0 := false
+		for _, cl := range info.inputs {
+			l0 = l0 || cl.level == 0
+		}
+		if !l0 {
+			continue
+		}
+		compactions = append(compactions, manifest.L0Compaction{
+			Smallest:  info.smallest,
+			Largest:   info.largest,
+			IsIntraL0: info.outputLevel == 0,
+		})
+	}
+	return compactions
 }
 
 // firstError returns the first non-nil error of err0 and err1, or nil if both

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
@@ -66,6 +67,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		logRecycler:         logRecycler{limit: opts.MemTableStopWritesThreshold + 1},
 		closedCh:            make(chan struct{}),
 	}
+	d.mu.versions = &versionSet{}
 
 	defer func() {
 		// If an error or panic occurs during open, attempt to release the manually
@@ -100,13 +102,20 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	d.tableCache.init(d.cacheID, dirname, opts.FS, d.opts, tableCacheSize)
 	d.newIters = d.tableCache.newIters
 	d.commit = newCommitPipeline(commitEnv{
-		logSeqNum:     &d.mu.versions.logSeqNum,
-		visibleSeqNum: &d.mu.versions.visibleSeqNum,
+		logSeqNum:     &d.mu.versions.atomic.logSeqNum,
+		visibleSeqNum: &d.mu.versions.atomic.visibleSeqNum,
 		apply:         d.commitApply,
 		write:         d.commitWrite,
 	})
-	d.compactionLimiter = rate.NewLimiter(rate.Limit(d.opts.MinCompactionRate), d.opts.MinCompactionRate)
-	d.flushLimiter = rate.NewLimiter(rate.Limit(d.opts.MinFlushRate), d.opts.MinFlushRate)
+	d.compactionLimiter = rate.NewLimiter(
+		rate.Limit(d.opts.private.minCompactionRate),
+		d.opts.private.minCompactionRate)
+	d.flushLimiter = rate.NewLimiter(
+		rate.Limit(d.opts.private.minFlushRate),
+		d.opts.private.minFlushRate)
+	d.deletionLimiter = rate.NewLimiter(
+		rate.Limit(d.opts.Experimental.MinDeletionRate),
+		d.opts.Experimental.MinDeletionRate)
 	d.mu.nextJobID = 1
 	d.mu.mem.nextSize = opts.MemTableSize
 	if d.mu.mem.nextSize > initialMemTableSize {
@@ -119,7 +128,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	d.mu.snapshots.init()
 	// logSeqNum is the next sequence number that will be assigned. Start
 	// assigning sequence numbers from 1 to match rocksdb.
-	d.mu.versions.logSeqNum = 1
+	d.mu.versions.atomic.logSeqNum = 1
 
 	d.timeNow = time.Now
 
@@ -177,7 +186,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	d.mu.nextJobID++
 
 	currentName := base.MakeFilename(opts.FS, dirname, fileTypeCurrent, 0)
-	if _, err := opts.FS.Stat(currentName); os.IsNotExist(err) &&
+	if _, err := opts.FS.Stat(currentName); oserror.IsNotExist(err) &&
 		!d.opts.ReadOnly && !d.opts.ErrorIfNotExists {
 		// Create the DB if it did not already exist.
 		if err := d.mu.versions.create(jobID, dirname, d.dataDir, opts, &d.mu.Mutex); err != nil {
@@ -202,7 +211,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	// sequence number of the first batch that will be inserted.
 	if !d.opts.ReadOnly {
 		var entry *flushableEntry
-		d.mu.mem.mutable, entry = d.newMemTable(0 /* logNum */, d.mu.versions.logSeqNum)
+		d.mu.mem.mutable, entry = d.newMemTable(0 /* logNum */, d.mu.versions.atomic.logSeqNum)
 		d.mu.mem.queue = append(d.mu.mem.queue, entry)
 	}
 
@@ -224,6 +233,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		name string
 	}
 	var logFiles []fileNumAndName
+	var strictWALTail bool
 	for _, filename := range ls {
 		ft, fn, ok := base.ParseFilename(opts.FS, filename)
 		if !ok {
@@ -245,7 +255,8 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 				d.logRecycler.minRecycleLogNum = fn + 1
 			}
 		case fileTypeOptions:
-			if err := checkOptions(opts, opts.FS.PathJoin(dirname, filename)); err != nil {
+			strictWALTail, err = checkOptions(opts, opts.FS.PathJoin(dirname, filename))
+			if err != nil {
 				return nil, err
 			}
 		case fileTypeTemp:
@@ -264,17 +275,19 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	})
 
 	var ve versionEdit
-	for _, lf := range logFiles {
-		maxSeqNum, err := d.replayWAL(jobID, &ve, opts.FS, opts.FS.PathJoin(d.walDirname, lf.name), lf.num)
+	for i, lf := range logFiles {
+		lastWAL := i == len(logFiles)-1
+		maxSeqNum, err := d.replayWAL(jobID, &ve, opts.FS,
+			opts.FS.PathJoin(d.walDirname, lf.name), lf.num, strictWALTail && !lastWAL)
 		if err != nil {
 			return nil, err
 		}
 		d.mu.versions.markFileNumUsed(lf.num)
-		if d.mu.versions.logSeqNum < maxSeqNum {
-			d.mu.versions.logSeqNum = maxSeqNum
+		if d.mu.versions.atomic.logSeqNum < maxSeqNum {
+			d.mu.versions.atomic.logSeqNum = maxSeqNum
 		}
 	}
-	d.mu.versions.visibleSeqNum = d.mu.versions.logSeqNum
+	d.mu.versions.atomic.visibleSeqNum = d.mu.versions.atomic.logSeqNum
 
 	if !d.opts.ReadOnly {
 		// Create an empty .log file.
@@ -298,7 +311,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		d.mu.mem.queue[len(d.mu.mem.queue)-1].logNum = newLogNum
 
 		logFile = vfs.NewSyncingFile(logFile, vfs.SyncingFileOptions{
-			BytesPerSync:    d.opts.BytesPerSync,
+			BytesPerSync:    d.opts.WALBytesPerSync,
 			PreallocateSize: d.walPreallocateSize(),
 		})
 		d.mu.log.LogWriter = record.NewLogWriter(logFile, newLogNum)
@@ -427,7 +440,7 @@ func GetVersion(dir string, fs vfs.FS) (string, error) {
 // d.mu must be held when calling this, but the mutex may be dropped and
 // re-acquired during the course of this method.
 func (d *DB) replayWAL(
-	jobID int, ve *versionEdit, fs vfs.FS, filename string, logNum FileNum,
+	jobID int, ve *versionEdit, fs vfs.FS, filename string, logNum FileNum, strictWALTail bool,
 ) (maxSeqNum uint64, err error) {
 	file, err := fs.Open(filename)
 	if err != nil {
@@ -492,10 +505,13 @@ func (d *DB) replayWAL(
 		}
 		if err != nil {
 			// It is common to encounter a zeroed or invalid chunk due to WAL
-			// preallocation and WAL recycling. We need to distinguish these errors
-			// from EOF in order to recognize that the record was truncated, but want
+			// preallocation and WAL recycling. We need to distinguish these
+			// errors from EOF in order to recognize that the record was
+			// truncated and to avoid replaying subsequent WALs, but want
 			// to otherwise treat them like EOF.
-			if err == io.EOF || record.IsInvalidRecord(err) {
+			if err == io.EOF {
+				break
+			} else if record.IsInvalidRecord(err) && !strictWALTail {
 				break
 			}
 			return 0, errors.Wrap(err, "pebble: error when replaying WAL")
@@ -513,7 +529,7 @@ func (d *DB) replayWAL(
 		seqNum := b.SeqNum()
 		maxSeqNum = seqNum + uint64(b.Count())
 
-		if b.memTableSize >= uint32(d.largeBatchThreshold) {
+		if b.memTableSize >= uint64(d.largeBatchThreshold) {
 			flushMem()
 			// Make a copy of the data slice since it is currently owned by buf and will
 			// be reused in the next iteration.
@@ -555,7 +571,7 @@ func (d *DB) replayWAL(
 	// mem is nil here.
 	if !d.opts.ReadOnly {
 		c := newFlush(d.opts, d.mu.versions.currentVersion(),
-			1 /* base level */, toFlush, &d.bytesFlushed)
+			1 /* base level */, toFlush, &d.atomic.bytesFlushed)
 		newVE, _, err := d.runCompaction(jobID, c, nilPacer)
 		if err != nil {
 			return 0, err
@@ -565,19 +581,19 @@ func (d *DB) replayWAL(
 			toFlush[i].readerUnref()
 		}
 	}
-	return maxSeqNum, nil
+	return maxSeqNum, err
 }
 
-func checkOptions(opts *Options, path string) error {
+func checkOptions(opts *Options, path string) (strictWALTail bool, err error) {
 	f, err := opts.FS.Open(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer f.Close()
 
 	data, err := ioutil.ReadAll(f)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return opts.Check(string(data))
+	return opts.checkOptions(string(data))
 }

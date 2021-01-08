@@ -29,7 +29,8 @@ import "fmt"
 //
 // The relative positioning methods can be used in conjunction with any of the
 // absolute positioning methods with one exception: SeekPrefixGE does not
-// support reverse iteration via Prev.
+// support reverse iteration via Prev. It is undefined to call relative
+// positioning methods without ever calling an absolute positioning method.
 //
 // InternalIterators can optionally implement a prefix iteration mode. This
 // mode is entered by calling SeekPrefixGE and exited by any other absolute
@@ -59,7 +60,8 @@ import "fmt"
 // bounds, never returning records outside of the bounds with one exception:
 // an iterator may generate synthetic RANGEDEL marker records. See
 // levelIter.syntheticBoundary for the sole existing example of this behavior.
-// [TODO(peter): can we eliminate this exception?]
+// Specifically, levelIter can return synthetic keys whose user key is equal
+// to the lower/upper bound.
 //
 // An iterator must be closed after use, but it is not necessary to read an
 // iterator until exhaustion.
@@ -120,15 +122,15 @@ type InternalIterator interface {
 	// First moves the iterator the the first key/value pair. Returns the key and
 	// value if the iterator is pointing at a valid entry, and (nil, nil)
 	// otherwise. Note that First only checks the upper bound. It is up to the
-	// caller to ensure that key is greater than or equal to the lower bound
-	// (e.g. via a call to SeekGE(lower)).
+	// caller to ensure that First() is not called when there is a lower bound,
+	// and instead call SeekGE(lower).
 	First() (*InternalKey, []byte)
 
 	// Last moves the iterator the the last key/value pair. Returns the key and
 	// value if the iterator is pointing at a valid entry, and (nil, nil)
 	// otherwise. Note that Last only checks the lower bound. It is up to the
-	// caller to ensure that key is less than the upper bound (e.g. via a call
-	// to SeekLT(upper))
+	// caller to ensure that Last() is not called when there is an upper bound,
+	// and instead call SeekLT(upper).
 	Last() (*InternalKey, []byte)
 
 	// Next moves the iterator to the next key/value pair. Returns the key and
@@ -138,8 +140,8 @@ type InternalIterator interface {
 	//
 	// It is valid to call Next when the iterator is positioned before the first
 	// key/value pair due to either a prior call to SeekLT or Prev which returned
-	// (nil, nil). It is undefined to call Next when the previous call to SeekGE
-	// or Next returned (nil, nil).
+	// (nil, nil). It is not allowed to call Next when the previous call to SeekGE,
+	// SeekPrefixGE or Next returned (nil, nil).
 	Next() (*InternalKey, []byte)
 
 	// Prev moves the iterator to the previous key/value pair. Returns the key
@@ -149,7 +151,7 @@ type InternalIterator interface {
 	//
 	// It is valid to call Prev when the iterator is positioned after the last
 	// key/value pair due to either a prior call to SeekGE or Next which returned
-	// (nil, nil). It is undefined to call Next when the previous call to SeekLT
+	// (nil, nil). It is not allowed to call Prev when the previous call to SeekLT
 	// or Prev returned (nil, nil).
 	Prev() (*InternalKey, []byte)
 

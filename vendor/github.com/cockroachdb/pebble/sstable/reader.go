@@ -15,6 +15,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
@@ -27,6 +28,7 @@ import (
 )
 
 var errCorruptIndexEntry = base.CorruptionErrorf("pebble/table: corrupt index entry")
+var errReaderClosed = errors.New("pebble/table: reader is closed")
 
 const (
 	// Constants for dynamic readahead of data blocks. Note that the size values
@@ -94,7 +96,7 @@ type singleLevelIterator struct {
 	// or exactly one key before or after the bounds. If the new bounds is
 	// after/before the previous bounds, and we are already positioned at a
 	// block that is relevant for the new bounds, we can try to first position
-	// using Next/Prev instead of doing a more expensive seek.
+	// using Next/Prev (repeatedly) instead of doing a more expensive seek.
 	//
 	// When there are wide files at higher levels that match the bounds
 	// but don't have any data for the bound, we will already be
@@ -110,8 +112,50 @@ type singleLevelIterator struct {
 	// the previous bounds. If it was not positioned, i.e., Seek/First/Last
 	// were not called, we don't know where it is positioned and cannot
 	// optimize.
+	//
+	// Example: Bounds moving forward, and iterator exhausted in forward direction.
+	//      bounds = [f, h), ^ shows block iterator position
+	//  file contents [ a  b  c  d  e  f  g  h  i  j  k ]
+	//                                       ^
+	//  new bounds = [j, k). Since positionedUsingLatestBounds=true, boundsCmp is
+	//  set to +1. SeekGE(j) can use next (the optimization also requires that j
+	//  is within the block, but that is not for correctness, but to limit the
+	//  optimization to when it will actually be an optimization).
+	//
+	// Example: Bounds moving forward.
+	//      bounds = [f, h), ^ shows block iterator position
+	//  file contents [ a  b  c  d  e  f  g  h  i  j  k ]
+	//                                 ^
+	//  new bounds = [j, k). Since positionedUsingLatestBounds=true, boundsCmp is
+	//  set to +1. SeekGE(j) can use next.
+	//
+	// Example: Bounds moving forward, but iterator not positioned using previous
+	//  bounds.
+	//      bounds = [f, h), ^ shows block iterator position
+	//  file contents [ a  b  c  d  e  f  g  h  i  j  k ]
+	//                                             ^
+	//  new bounds = [i, j). Iterator is at j since it was never positioned using
+	//  [f, h). So positionedUsingLatestBounds=false, and boundsCmp is set to 0.
+	//  SeekGE(i) will not use next.
+	//
+	// Example: Bounds moving forward and sparse file
+	//      bounds = [f, h), ^ shows block iterator position
+	//  file contents [ a z ]
+	//                    ^
+	//  new bounds = [j, k). Since positionedUsingLatestBounds=true, boundsCmp is
+	//  set to +1. SeekGE(j) notices that the iterator is already past j and does
+	//  not need to do anything.
+	//
+	// Similar examples can be constructed for backward iteration.
+
 	boundsCmp                   int
 	positionedUsingLatestBounds bool
+
+	// exhaustedBounds represents whether the iterator is exhausted for
+	// iteration by reaching the upper or lower bound. +1 when exhausted
+	// the upper bound, -1 when exhausted the lower bound, and 0 when
+	// neither. It is used for invariant checking.
+	exhaustedBounds int8
 }
 
 // singleLevelIterator implements the base.InternalIterator interface.
@@ -187,6 +231,19 @@ func (i *singleLevelIterator) init(r *Reader, lower, upper []byte) error {
 	return nil
 }
 
+// setupForCompaction sets up the singleLevelIterator for use with compactionIter.
+// Currently, it skips readahead ramp-up. It should be called after init is called.
+func (i *singleLevelIterator) setupForCompaction() {
+	if i.reader.fs != nil {
+		f, err := i.reader.fs.Open(i.reader.filename, vfs.SequentialReadsOption)
+		if err == nil {
+			// Given that this iterator is for a compaction, we can assume that it
+			// will be read sequentially and we can skip the readahead ramp-up.
+			i.dataRS.sequentialFile = f
+		}
+	}
+}
+
 func (i *singleLevelIterator) resetForReuse() singleLevelIterator {
 	return singleLevelIterator{
 		index: i.index.resetForReuse(),
@@ -241,6 +298,8 @@ func (i *singleLevelIterator) loadBlock() bool {
 	}
 	i.err = i.data.initHandle(i.cmp, block, i.reader.Properties.GlobalSeqNum)
 	if i.err != nil {
+		// The block is partially loaded, and we don't want it to appear valid.
+		i.data.invalidate()
 		return false
 	}
 	i.initBounds()
@@ -248,6 +307,9 @@ func (i *singleLevelIterator) loadBlock() bool {
 }
 
 func (i *singleLevelIterator) initBoundsForAlreadyLoadedBlock() {
+	if i.data.firstKey.UserKey == nil {
+		panic("initBoundsForAlreadyLoadedBlock must not be called on empty or corrupted block")
+	}
 	i.blockLower = i.lower
 	if i.blockLower != nil {
 		if i.data.firstKey.UserKey != nil && i.cmp(i.blockLower, i.data.firstKey.UserKey) < 0 {
@@ -267,6 +329,8 @@ func (i *singleLevelIterator) initBoundsForAlreadyLoadedBlock() {
 
 // The number of times to call Next/Prev in a block before giving up and seeking.
 // The value of 4 is arbitrary.
+// TODO(sumeer): experiment with dynamic adjustment based on the history of
+// seeks for a particular iterator.
 const numStepsBeforeSeek = 4
 
 func (i *singleLevelIterator) trySeekGEUsingNextWithinBlock(
@@ -277,6 +341,7 @@ func (i *singleLevelIterator) trySeekGEUsingNextWithinBlock(
 		curKeyCmp := i.cmp(k.UserKey, key)
 		if curKeyCmp >= 0 {
 			if i.blockUpper != nil && i.cmp(k.UserKey, i.blockUpper) >= 0 {
+				i.exhaustedBounds = +1
 				return nil, nil, true
 			}
 			return k, v, true
@@ -297,6 +362,7 @@ func (i *singleLevelIterator) trySeekLTUsingPrevWithinBlock(
 		curKeyCmp := i.cmp(k.UserKey, key)
 		if curKeyCmp < 0 {
 			if i.blockLower != nil && i.cmp(k.UserKey, i.blockLower) < 0 {
+				i.exhaustedBounds = -1
 				return nil, nil, true
 			}
 			return k, v, true
@@ -331,6 +397,7 @@ func (i *singleLevelIterator) recordOffset() uint64 {
 // package. Note that SeekGE only checks the upper bound. It is up to the
 // caller to ensure that key is greater than or equal to the lower bound.
 func (i *singleLevelIterator) SeekGE(key []byte) (*InternalKey, []byte) {
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	boundsCmp := i.boundsCmp
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
@@ -342,8 +409,7 @@ func (i *singleLevelIterator) SeekGE(key []byte) (*InternalKey, []byte) {
 // seekGEHelper contains the common functionality for SeekGE and SeekPrefixGE.
 func (i *singleLevelIterator) seekGEHelper(key []byte, boundsCmp int) (*InternalKey, []byte) {
 	var dontSeekWithinBlock bool
-
-	if !i.data.isInvalid() && !i.index.isInvalid() && i.data.Valid() && i.index.Valid() &&
+	if !i.data.isDataInvalidated() && !i.index.isDataInvalidated() && i.data.Valid() && i.index.Valid() &&
 		boundsCmp > 0 && i.cmp(key, i.index.Key().UserKey) <= 0 {
 		// Fast-path: The bounds have moved forward and this SeekGE is
 		// respecting the lower bound (guaranteed by Iterator). We know that
@@ -379,6 +445,7 @@ func (i *singleLevelIterator) seekGEHelper(key []byte, boundsCmp int) (*Internal
 	if !dontSeekWithinBlock {
 		if ikey, val := i.data.SeekGE(key); ikey != nil {
 			if i.blockUpper != nil && i.cmp(ikey.UserKey, i.blockUpper) >= 0 {
+				i.exhaustedBounds = +1
 				return nil, nil
 			}
 			return ikey, val
@@ -391,13 +458,16 @@ func (i *singleLevelIterator) seekGEHelper(key []byte, boundsCmp int) (*Internal
 // pebble package. Note that SeekPrefixGE only checks the upper bound. It is up
 // to the caller to ensure that key is greater than or equal to the lower bound.
 func (i *singleLevelIterator) SeekPrefixGE(prefix, key []byte) (*InternalKey, []byte) {
-	i.err = nil // clear cached iteration error
-	boundsCmp := i.boundsCmp
-	// Seek optimization only applies until iterator is first positioned after SetBounds.
-	i.boundsCmp = 0
+	return i.seekPrefixGE(prefix, key, true /* checkFilter */)
+}
 
-	// Check prefix bloom filter.
-	if i.reader.tableFilter != nil {
+func (i *singleLevelIterator) seekPrefixGE(
+	prefix, key []byte, checkFilter bool,
+) (*InternalKey, []byte) {
+	i.err = nil // clear cached iteration error
+
+	if checkFilter && i.reader.tableFilter != nil {
+		// Check prefix bloom filter.
 		var dataH cache.Handle
 		dataH, i.err = i.reader.readFilter()
 		if i.err != nil {
@@ -407,11 +477,21 @@ func (i *singleLevelIterator) SeekPrefixGE(prefix, key []byte) (*InternalKey, []
 		mayContain := i.reader.tableFilter.mayContain(dataH.Get(), prefix)
 		dataH.Release()
 		if !mayContain {
+			// This invalidation may not be necessary for correctness, and may
+			// be a place to optimize later by reusing the already loaded
+			// block. It was necessary in earlier versions of the code since
+			// the caller was allowed to call Next when SeekPrefixGE returned
+			// nil. This is no longer allowed.
 			i.data.invalidate()
 			return nil, nil
 		}
 	}
-	// Bloom filter matches, so this method will position the iterator.
+	// Bloom filter matches, or skipped, so this method will position the
+	// iterator.
+	i.exhaustedBounds = 0
+	boundsCmp := i.boundsCmp
+	// Seek optimization only applies until iterator is first positioned after SetBounds.
+	i.boundsCmp = 0
 	i.positionedUsingLatestBounds = true
 	return i.seekGEHelper(key, boundsCmp)
 }
@@ -420,6 +500,7 @@ func (i *singleLevelIterator) SeekPrefixGE(prefix, key []byte) (*InternalKey, []
 // package. Note that SeekLT only checks the lower bound. It is up to the
 // caller to ensure that key is less than the upper bound.
 func (i *singleLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	boundsCmp := i.boundsCmp
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
@@ -427,7 +508,7 @@ func (i *singleLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
 	i.positionedUsingLatestBounds = true
 
 	var dontSeekWithinBlock bool
-	if !i.data.isInvalid() && !i.index.isInvalid() && i.data.Valid() && i.index.Valid() &&
+	if !i.data.isDataInvalidated() && !i.index.isDataInvalidated() && i.data.Valid() && i.index.Valid() &&
 		boundsCmp < 0 && i.cmp(i.data.firstKey.UserKey, key) < 0 {
 		// Fast-path: The bounds have moved backward, and this SeekLT is
 		// respecting the upper bound (guaranteed by Iterator). We know that
@@ -458,6 +539,7 @@ func (i *singleLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
 	if !dontSeekWithinBlock {
 		if ikey, val := i.data.SeekLT(key); ikey != nil {
 			if i.blockLower != nil && i.cmp(ikey.UserKey, i.blockLower) < 0 {
+				i.exhaustedBounds = -1
 				return nil, nil
 			}
 			return ikey, val
@@ -482,10 +564,22 @@ func (i *singleLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
 // to ensure that key is greater than or equal to the lower bound (e.g. via a
 // call to SeekGE(lower)).
 func (i *singleLevelIterator) First() (*InternalKey, []byte) {
+	if i.lower != nil {
+		panic("singleLevelIterator.First() used despite lower bound")
+	}
+	i.positionedUsingLatestBounds = true
+	return i.firstInternal()
+}
+
+// firstInternal is a helper used for absolute positioning in a single-level
+// index file, or for positioning in the second-level index in a two-level
+// index file. For the latter, one cannot make any claims about absolute
+// positioning.
+func (i *singleLevelIterator) firstInternal() (*InternalKey, []byte) {
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
-	i.positionedUsingLatestBounds = true
 
 	if ikey, _ := i.index.First(); ikey == nil {
 		i.data.invalidate()
@@ -496,6 +590,7 @@ func (i *singleLevelIterator) First() (*InternalKey, []byte) {
 	}
 	if ikey, val := i.data.First(); ikey != nil {
 		if i.blockUpper != nil && i.cmp(ikey.UserKey, i.blockUpper) >= 0 {
+			i.exhaustedBounds = +1
 			return nil, nil
 		}
 		return ikey, val
@@ -508,10 +603,22 @@ func (i *singleLevelIterator) First() (*InternalKey, []byte) {
 // to ensure that key is less than the upper bound (e.g. via a call to
 // SeekLT(upper))
 func (i *singleLevelIterator) Last() (*InternalKey, []byte) {
+	if i.upper != nil {
+		panic("singleLevelIterator.Last() used despite upper bound")
+	}
+	i.positionedUsingLatestBounds = true
+	return i.lastInternal()
+}
+
+// lastInternal is a helper used for absolute positioning in a single-level
+// index file, or for positioning in the second-level index in a two-level
+// index file. For the latter, one cannot make any claims about absolute
+// positioning.
+func (i *singleLevelIterator) lastInternal() (*InternalKey, []byte) {
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
-	i.positionedUsingLatestBounds = true
 
 	if ikey, _ := i.index.Last(); ikey == nil {
 		i.data.invalidate()
@@ -522,6 +629,7 @@ func (i *singleLevelIterator) Last() (*InternalKey, []byte) {
 	}
 	if ikey, val := i.data.Last(); ikey != nil {
 		if i.blockLower != nil && i.cmp(ikey.UserKey, i.blockLower) < 0 {
+			i.exhaustedBounds = -1
 			return nil, nil
 		}
 		return ikey, val
@@ -534,6 +642,10 @@ func (i *singleLevelIterator) Last() (*InternalKey, []byte) {
 // Note: compactionIterator.Next mirrors the implementation of Iterator.Next
 // due to performance. Keep the two in sync.
 func (i *singleLevelIterator) Next() (*InternalKey, []byte) {
+	if i.exhaustedBounds == +1 {
+		panic("Next called even though exhausted upper bound")
+	}
+	i.exhaustedBounds = 0
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
 
@@ -542,6 +654,7 @@ func (i *singleLevelIterator) Next() (*InternalKey, []byte) {
 	}
 	if key, val := i.data.Next(); key != nil {
 		if i.blockUpper != nil && i.cmp(key.UserKey, i.blockUpper) >= 0 {
+			i.exhaustedBounds = +1
 			return nil, nil
 		}
 		return key, val
@@ -552,6 +665,10 @@ func (i *singleLevelIterator) Next() (*InternalKey, []byte) {
 // Prev implements internalIterator.Prev, as documented in the pebble
 // package.
 func (i *singleLevelIterator) Prev() (*InternalKey, []byte) {
+	if i.exhaustedBounds == -1 {
+		panic("Prev called even though exhausted lower bound")
+	}
+	i.exhaustedBounds = 0
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
 
@@ -560,6 +677,7 @@ func (i *singleLevelIterator) Prev() (*InternalKey, []byte) {
 	}
 	if key, val := i.data.Prev(); key != nil {
 		if i.blockLower != nil && i.cmp(key.UserKey, i.blockLower) < 0 {
+			i.exhaustedBounds = -1
 			return nil, nil
 		}
 		return key, val
@@ -581,6 +699,7 @@ func (i *singleLevelIterator) skipForward() (*InternalKey, []byte) {
 		}
 		if key, val := i.data.First(); key != nil {
 			if i.blockUpper != nil && i.cmp(key.UserKey, i.blockUpper) >= 0 {
+				i.exhaustedBounds = +1
 				return nil, nil
 			}
 			return key, val
@@ -606,6 +725,7 @@ func (i *singleLevelIterator) skipBackward() (*InternalKey, []byte) {
 			return nil, nil
 		}
 		if i.blockLower != nil && i.cmp(key.UserKey, i.blockLower) < 0 {
+			i.exhaustedBounds = -1
 			return nil, nil
 		}
 		return key, val
@@ -666,6 +786,15 @@ func (i *singleLevelIterator) String() string {
 	return i.reader.fileNum.String()
 }
 
+// Deterministic disabling of the bounds-based optimization that avoids seeking.
+// Uses the iterator pointer, since we want diversity in iterator behavior for
+// the same SetBounds call. Used for tests.
+func disableBoundsOpt(bound []byte, ptr uintptr) bool {
+	// Fibonacci hash https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
+	simpleHash := (11400714819323198485 * uint64(ptr)) >> 63
+	return bound[len(bound)-1]&byte(1) == 0 && simpleHash == 0
+}
+
 // SetBounds implements internalIterator.SetBounds, as documented in the pebble
 // package.
 func (i *singleLevelIterator) SetBounds(lower, upper []byte) {
@@ -673,8 +802,14 @@ func (i *singleLevelIterator) SetBounds(lower, upper []byte) {
 	if i.positionedUsingLatestBounds {
 		if i.upper != nil && lower != nil && i.cmp(i.upper, lower) <= 0 {
 			i.boundsCmp = +1
+			if invariants.Enabled && disableBoundsOpt(lower, uintptr(unsafe.Pointer(i))) {
+				i.boundsCmp = 0
+			}
 		} else if i.lower != nil && upper != nil && i.cmp(upper, i.lower) <= 0 {
 			i.boundsCmp = -1
+			if invariants.Enabled && disableBoundsOpt(upper, uintptr(unsafe.Pointer(i))) {
+				i.boundsCmp = 0
+			}
 		}
 		i.positionedUsingLatestBounds = false
 	}
@@ -822,9 +957,10 @@ func (i *twoLevelIterator) String() string {
 // package. Note that SeekGE only checks the upper bound. It is up to the
 // caller to ensure that key is greater than or equal to the lower bound.
 func (i *twoLevelIterator) SeekGE(key []byte) (*InternalKey, []byte) {
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 
-	if i.topLevelIndex.isInvalid() || !i.topLevelIndex.Valid() || i.boundsCmp <= 0 ||
+	if i.topLevelIndex.isDataInvalidated() || !i.topLevelIndex.Valid() || i.boundsCmp <= 0 ||
 		i.cmp(key, i.topLevelIndex.Key().UserKey) > 0 {
 		// Slow-path: need to position the topLevelIndex.
 		if ikey, _ := i.topLevelIndex.SeekGE(key); ikey == nil {
@@ -858,10 +994,31 @@ func (i *twoLevelIterator) SeekGE(key []byte) (*InternalKey, []byte) {
 func (i *twoLevelIterator) SeekPrefixGE(prefix, key []byte) (*InternalKey, []byte) {
 	i.err = nil // clear cached iteration error
 
-	// TODO(sumeer): check the bloom filter before doing other work and not
-	// delay it until singleLevelIterator.SeekPrefixGE.
+	// Check prefix bloom filter.
+	if i.reader.tableFilter != nil {
+		var dataH cache.Handle
+		dataH, i.err = i.reader.readFilter()
+		if i.err != nil {
+			i.data.invalidate()
+			return nil, nil
+		}
+		mayContain := i.reader.tableFilter.mayContain(dataH.Get(), prefix)
+		dataH.Release()
+		if !mayContain {
+			// This invalidation may not be necessary for correctness, and may
+			// be a place to optimize later by reusing the already loaded
+			// block. It was necessary in earlier versions of the code since
+			// the caller was allowed to call Next when SeekPrefixGE returned
+			// nil. This is no longer allowed.
+			i.data.invalidate()
+			return nil, nil
+		}
+	}
 
-	if i.topLevelIndex.isInvalid() || !i.topLevelIndex.Valid() || i.boundsCmp <= 0 ||
+	// Bloom filter matches.
+	i.exhaustedBounds = 0
+
+	if i.topLevelIndex.isDataInvalidated() || !i.topLevelIndex.Valid() || i.boundsCmp <= 0 ||
 		i.cmp(key, i.topLevelIndex.Key().UserKey) > 0 {
 		// Slow-path: need to position the topLevelIndex.
 		if ikey, _ := i.topLevelIndex.SeekGE(key); ikey == nil {
@@ -883,7 +1040,8 @@ func (i *twoLevelIterator) SeekPrefixGE(prefix, key []byte) (*InternalKey, []byt
 	// confirms that it is not behind. Since it is not ahead and not behind
 	// it must be at the right position.
 
-	if ikey, val := i.singleLevelIterator.SeekPrefixGE(prefix, key); ikey != nil {
+	if ikey, val := i.singleLevelIterator.seekPrefixGE(
+		prefix, key, false /* checkFilter */); ikey != nil {
 		return ikey, val
 	}
 	return i.skipForward()
@@ -893,6 +1051,7 @@ func (i *twoLevelIterator) SeekPrefixGE(prefix, key []byte) (*InternalKey, []byt
 // package. Note that SeekLT only checks the lower bound. It is up to the
 // caller to ensure that key is less than the upper bound.
 func (i *twoLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
@@ -912,7 +1071,7 @@ func (i *twoLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
 			return nil, nil
 		}
 
-		return i.singleLevelIterator.Last()
+		return i.singleLevelIterator.lastInternal()
 	}
 
 	if !i.loadIndex() {
@@ -930,6 +1089,10 @@ func (i *twoLevelIterator) SeekLT(key []byte) (*InternalKey, []byte) {
 // to ensure that key is greater than or equal to the lower bound (e.g. via a
 // call to SeekGE(lower)).
 func (i *twoLevelIterator) First() (*InternalKey, []byte) {
+	if i.lower != nil {
+		panic("twoLevelIterator.First() used despite lower bound")
+	}
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
@@ -953,6 +1116,10 @@ func (i *twoLevelIterator) First() (*InternalKey, []byte) {
 // to ensure that key is less than the upper bound (e.g. via a call to
 // SeekLT(upper))
 func (i *twoLevelIterator) Last() (*InternalKey, []byte) {
+	if i.upper != nil {
+		panic("twoLevelIterator.Last() used despite upper bound")
+	}
+	i.exhaustedBounds = 0
 	i.err = nil // clear cached iteration error
 	// Seek optimization only applies until iterator is first positioned after SetBounds.
 	i.boundsCmp = 0
@@ -976,6 +1143,8 @@ func (i *twoLevelIterator) Last() (*InternalKey, []byte) {
 // Note: twoLevelCompactionIterator.Next mirrors the implementation of
 // twoLevelIterator.Next due to performance. Keep the two in sync.
 func (i *twoLevelIterator) Next() (*InternalKey, []byte) {
+	// Seek optimization only applies until iterator is first positioned after SetBounds.
+	i.boundsCmp = 0
 	if i.err != nil {
 		return nil, nil
 	}
@@ -988,6 +1157,8 @@ func (i *twoLevelIterator) Next() (*InternalKey, []byte) {
 // Prev implements internalIterator.Prev, as documented in the pebble
 // package.
 func (i *twoLevelIterator) Prev() (*InternalKey, []byte) {
+	// Seek optimization only applies until iterator is first positioned after SetBounds.
+	i.boundsCmp = 0
 	if i.err != nil {
 		return nil, nil
 	}
@@ -1005,8 +1176,10 @@ func (i *twoLevelIterator) skipForward() (*InternalKey, []byte) {
 		if i.singleLevelIterator.valid() {
 			// The iterator is positioned at valid record in the current data block
 			// which implies the previous positioning call reached the upper bound.
+			//
 			return nil, nil
 		}
+		i.exhaustedBounds = 0
 		if ikey, _ := i.topLevelIndex.Next(); ikey == nil {
 			i.data.invalidate()
 			i.index.invalidate()
@@ -1015,7 +1188,7 @@ func (i *twoLevelIterator) skipForward() (*InternalKey, []byte) {
 		if !i.loadIndex() {
 			return nil, nil
 		}
-		if ikey, val := i.singleLevelIterator.First(); ikey != nil {
+		if ikey, val := i.singleLevelIterator.firstInternal(); ikey != nil {
 			return ikey, val
 		}
 	}
@@ -1031,6 +1204,7 @@ func (i *twoLevelIterator) skipBackward() (*InternalKey, []byte) {
 			// which implies the previous positioning call reached the lower bound.
 			return nil, nil
 		}
+		i.exhaustedBounds = 0
 		if ikey, _ := i.topLevelIndex.Prev(); ikey == nil {
 			i.data.invalidate()
 			i.index.invalidate()
@@ -1039,7 +1213,7 @@ func (i *twoLevelIterator) skipBackward() (*InternalKey, []byte) {
 		if !i.loadIndex() {
 			return nil, nil
 		}
-		if ikey, val := i.singleLevelIterator.Last(); ikey != nil {
+		if ikey, val := i.singleLevelIterator.lastInternal(); ikey != nil {
 			return ikey, val
 		}
 	}
@@ -1440,7 +1614,7 @@ func init() {
 
 // Reader is a table reader.
 type Reader struct {
-	file              vfs.File
+	file              ReadableFile
 	fs                vfs.FS
 	filename          string
 	cacheID           uint64
@@ -1459,6 +1633,7 @@ type Reader struct {
 	FormatKey         base.FormatKey
 	Split             Split
 	mergerOK          bool
+	checksumType      ChecksumType
 	tableFilter       *tableFilterReader
 	Properties        Properties
 }
@@ -1482,7 +1657,7 @@ func (r *Reader) Close() error {
 		}
 	}
 	// Make any future calls to Get, NewIter or Close return an error.
-	r.err = errors.New("pebble/table: reader is closed")
+	r.err = errReaderClosed
 	return nil
 }
 
@@ -1568,6 +1743,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64) (Iterator, error) {
 		if err != nil {
 			return nil, err
 		}
+		i.setupForCompaction()
 		return &twoLevelCompactionIterator{
 			twoLevelIterator: i,
 			bytesIterated:    bytesIterated,
@@ -1578,6 +1754,7 @@ func (r *Reader) NewCompactionIter(bytesIterated *uint64) (Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
+	i.setupForCompaction()
 	return &compactionIterator{
 		singleLevelIterator: i,
 		bytesIterated:       bytesIterated,
@@ -1644,10 +1821,21 @@ func (r *Reader) readBlock(
 						raState.sequentialFile = f
 						file = f
 					}
+
+					// If we tried to load a table that doesn't exist, panic
+					// immediately.  Something is seriously wrong if a table
+					// doesn't exist.
+					// See cockroachdb/cockroach#56490.
+					base.MustExist(r.fs, r.filename, panicFataler{}, err)
 				}
 			}
 			if raState.sequentialFile != nil {
-				_ = vfs.Prefetch(r.file, bh.Offset, uint64(readaheadSize))
+				type fd interface {
+					Fd() uintptr
+				}
+				if f, ok := r.file.(fd); ok {
+					_ = vfs.Prefetch(f.Fd(), bh.Offset, uint64(readaheadSize))
+				}
 			}
 		}
 	}
@@ -1659,9 +1847,18 @@ func (r *Reader) readBlock(
 		return cache.Handle{}, err
 	}
 
-	checksum0 := binary.LittleEndian.Uint32(b[bh.Length+1:])
-	checksum1 := crc.New(b[:bh.Length+1]).Value()
-	if checksum0 != checksum1 {
+	expectedChecksum := binary.LittleEndian.Uint32(b[bh.Length+1:])
+	var computedChecksum uint32
+	switch r.checksumType {
+	case ChecksumTypeCRC32c:
+		computedChecksum = crc.New(b[:bh.Length+1]).Value()
+	case ChecksumTypeXXHash64:
+		computedChecksum = uint32(xxhash.Sum64(b[:bh.Length+1]))
+	default:
+		return cache.Handle{}, errors.Errorf("unsupported checksum type: %d", r.checksumType)
+	}
+
+	if expectedChecksum != computedChecksum {
 		r.opts.Cache.Free(v)
 		return cache.Handle{}, base.CorruptionErrorf(
 			"pebble/table: invalid table %s (checksum mismatch at %d/%d)",
@@ -2015,9 +2212,16 @@ func (r *Reader) EstimateDiskUsage(start, end []byte) (uint64, error) {
 	return endBH.Offset + endBH.Length + blockTrailerLen - startBH.Offset, nil
 }
 
+// ReadableFile describes subset of vfs.File required for reading SSTs.
+type ReadableFile interface {
+	io.ReaderAt
+	io.Closer
+	Stat() (os.FileInfo, error)
+}
+
 // NewReader returns a new table reader for the file. Closing the reader will
 // close the file.
-func NewReader(f vfs.File, o ReaderOptions, extraOpts ...ReaderOption) (*Reader, error) {
+func NewReader(f ReadableFile, o ReaderOptions, extraOpts ...ReaderOption) (*Reader, error) {
 	o = o.ensureDefaults()
 	r := &Reader{
 		file: f,
@@ -2052,6 +2256,7 @@ func NewReader(f vfs.File, o ReaderOptions, extraOpts ...ReaderOption) (*Reader,
 		r.err = err
 		return nil, r.Close()
 	}
+	r.checksumType = footer.checksum
 	// Read the metaindex.
 	if err := r.readMetaindex(footer.metaindexBH); err != nil {
 		r.err = err
@@ -2269,4 +2474,10 @@ func (l *Layout) Describe(
 
 		h.Release()
 	}
+}
+
+type panicFataler struct{}
+
+func (panicFataler) Fatalf(format string, args ...interface{}) {
+	panic(errors.Errorf(format, args...))
 }

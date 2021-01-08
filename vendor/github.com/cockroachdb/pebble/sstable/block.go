@@ -269,7 +269,14 @@ func (i *blockIter) init(cmp Compare, block block, globalSeqNum uint64) error {
 	i.fullKey = i.fullKey[:0]
 	i.val = nil
 	i.clearCache()
-	i.readFirstKey()
+	if i.restarts > 0 {
+		if err := i.readFirstKey(); err != nil {
+			return err
+		}
+	} else {
+		// Block is empty.
+		i.firstKey = InternalKey{}
+	}
 	return nil
 }
 
@@ -288,7 +295,10 @@ func (i *blockIter) invalidate() {
 	i.data = nil
 }
 
-func (i *blockIter) isInvalid() bool {
+// isDataInvalidated returns true when the blockIter has been invalidated
+// using an invalidate call. NB: this is different from blockIter.Valid
+// which is part of the InternalIterator implementation.
+func (i *blockIter) isDataInvalidated() bool {
 	return i.data == nil
 }
 
@@ -305,7 +315,7 @@ func (i *blockIter) readEntry() {
 	ptr := unsafe.Pointer(uintptr(i.ptr) + uintptr(i.offset))
 
 	// This is an ugly performance hack. Reading entries from blocks is one of
-	// the inner-most routines and decoding the 3 varints per-entry takes a
+	// the inner-most routines and decoding the 3 varints per-entry takes
 	// significant time. Neither go1.11 or go1.12 will inline decodeVarint for
 	// us, so we do it manually. This provides a 10-15% performance improvement
 	// on blockIter benchmarks on both go1.11 and go1.12.
@@ -385,26 +395,22 @@ func (i *blockIter) readEntry() {
 	i.nextOffset = int32(uintptr(ptr)-uintptr(i.ptr)) + int32(value)
 }
 
-func (i *blockIter) readFirstKey() {
+func (i *blockIter) readFirstKey() error {
 	ptr := i.ptr
 
 	// This is an ugly performance hack. Reading entries from blocks is one of
-	// the inner-most routines and decoding the 3 varints per-entry takes a
+	// the inner-most routines and decoding the 3 varints per-entry takes
 	// significant time. Neither go1.11 or go1.12 will inline decodeVarint for
 	// us, so we do it manually. This provides a 10-15% performance improvement
 	// on blockIter benchmarks on both go1.11 and go1.12.
 	//
 	// TODO(peter): remove this hack if go:inline is ever supported.
 
-	var shared uint32
-	if a := *((*uint8)(ptr)); a < 128 {
-		shared = uint32(a)
+	if shared := *((*uint8)(ptr)); shared == 0 {
 		ptr = unsafe.Pointer(uintptr(ptr) + 1)
 	} else {
-		panic("first key in block should not share")
-	}
-	if shared != 0 {
-		panic("first key in block should not share")
+		// The shared length is != 0, which is invalid.
+		panic("first key in block must have zero shared length")
 	}
 
 	var unshared uint32
@@ -449,10 +455,11 @@ func (i *blockIter) readFirstKey() {
 			i.firstKey.SetSeqNum(i.globalSeqNum)
 		}
 	} else {
-		// TODO: propagate this error?
 		i.firstKey.Trailer = uint64(InternalKeyKindInvalid)
 		i.firstKey.UserKey = nil
+		return base.CorruptionErrorf("pebble/table: invalid firstKey in block")
 	}
+	return nil
 }
 
 func (i *blockIter) decodeInternalKey(key []byte) {

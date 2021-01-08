@@ -16,6 +16,7 @@ package redact
 
 import (
 	"fmt"
+	"reflect"
 
 	internalFmt "github.com/cockroachdb/redact/internal"
 )
@@ -25,7 +26,8 @@ import (
 func printArgFn(p *internalFmt.InternalPrinter, arg interface{}, verb rune) (newState int) {
 	redactLastWrites(p)
 
-	if verb == 'T' {
+	switch verb {
+	case 'T':
 		// If the value was wrapped, reveal its original type. Anything else is not very useful.
 		switch v := arg.(type) {
 		case safeWrapper:
@@ -35,6 +37,41 @@ func printArgFn(p *internalFmt.InternalPrinter, arg interface{}, verb rune) (new
 		}
 
 		// Shortcut: %T is always safe to print as-is.
+		internalFmt.PrintArg(p, arg, verb)
+		return len(internalFmt.Buf(p))
+	case 'p':
+		// Printing a pointer via %p is handled as special case in printf,
+		// so we need a special case here too. The other cases of
+		// printing a pointer via %v / %d %x etc is handled by the common path.
+
+		switch v := arg.(type) {
+		case safeWrapper:
+			// If the value was meant to be safe, then print it as-is.
+			internalFmt.PrintArg(p, v.a, verb)
+			return len(internalFmt.Buf(p))
+
+		case unsafeWrap:
+			// If it's been wrapped, unwrap it. This helps preserve the
+			// original pointer value in the output.
+			arg = v.a
+		}
+		// Now perform an unsafe print: we are assuming that the pointer
+		// representation by the fmt.printf code does not contain
+		// redaction markers, and go a short route. If that assumption did
+		// not hold (or is invalidated by changes upstream after this
+		// comment is written), this code should be changed to use the
+		// escapeWriter instead.
+		internalFmt.Append(p, startRedactableBytes)
+		internalFmt.PrintArg(p, arg, verb)
+		internalFmt.Append(p, endRedactableBytes)
+		return len(internalFmt.Buf(p))
+	}
+
+	// nil arguments are printed as-is. Note: a nil argument under
+	// interface{} is not the same as a nil pointer passed via a pointer
+	// of a concrete type. The latter kind of nil goes through
+	// redaction as usual, because it may have its own custom Format() method.
+	if arg == nil {
 		internalFmt.PrintArg(p, arg, verb)
 		return len(internalFmt.Buf(p))
 	}
@@ -76,7 +113,7 @@ func redactLastWrites(p *internalFmt.InternalPrinter) {
 // HelperForErrorf, where we want the %w verb to work properly. This
 // adds a little overhead to the processing, but this is OK because
 // typically the error path is not perf-critical.
-func annotateArg(arg interface{}, collectingError bool) interface{} {
+func annotateArg(arg interface{}, collectingError bool) (res interface{}) {
 	var newArg fmt.Formatter
 	err, isError := arg.(error)
 
@@ -99,6 +136,21 @@ func annotateArg(arg interface{}, collectingError bool) interface{} {
 		newArg = &escapeArg{arg: arg, enclose: false}
 
 	case SafeMessager:
+		defer func() {
+			// Observed in the wild: an object implements SafeMessager
+			// by value, and a nil pointer to that object is passed
+			// to the redact package. Try do so something meaningful.
+			// We don't try too hard though, as this interface
+			// is obsolete anyway.
+			if err := recover(); err != nil {
+				if p := reflect.ValueOf(v); p.Kind() == reflect.Ptr && p.IsNil() {
+					res = "<nil>"
+				} else {
+					res = "%!v(PANIC=SafeMessager)"
+				}
+			}
+		}()
+
 		// Obsolete interface.
 		// TODO(knz): Remove this.
 		newArg = &escapeArg{arg: v.SafeMessage(), enclose: false}

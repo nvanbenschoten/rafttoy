@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"runtime/pprof"
 	"sort"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/private"
@@ -66,14 +66,361 @@ type compactionLevel struct {
 	files manifest.LevelSlice
 }
 
+// Return output from compactionOutputSplitters. See comment on
+// compactionOutputSplitter.shouldSplitBefore() on how this value is used.
+type compactionSplitSuggestion int
+
+const (
+	noSplit compactionSplitSuggestion = iota
+	splitSoon
+	splitNow
+)
+
+// String implements the Stringer interface.
+func (c compactionSplitSuggestion) String() string {
+	switch c {
+	case noSplit:
+		return "no-split"
+	case splitSoon:
+		return "split-soon"
+	}
+	return "split-now"
+}
+
+// compactionOutputSplitter is an interface for encapsulating logic around
+// switching the output of a compaction to a new output file. Additional
+// constraints around switching compaction outputs that are specific to that
+// compaction type (eg. flush splits) are implemented in
+// compactionOutputSplitters that compose other child compactionOutputSplitters.
+type compactionOutputSplitter interface {
+	// shouldSplitBefore returns whether we should split outputs before the
+	// specified "current key". The return value is one of splitNow, splitSoon,
+	// or noSlit. splitNow means a split is advised before the specified key,
+	// splitSoon means no split is advised yet but the limit returned in
+	// onNewOutput can be considered invalidated and a splitNow suggestion will
+	// be made on an upcoming key shortly, and noSplit means no split is
+	// advised.
+	shouldSplitBefore(key *InternalKey, tw *sstable.Writer) compactionSplitSuggestion
+	// onNewOutput updates internal splitter state when the compaction switches
+	// to a new sstable, and returns the next limit for the new output which
+	// would get used to truncate range tombstones if the compaction iterator
+	// runs out of keys. The limit returned MUST be > key according to the
+	// compaction's comparator. The specified key is the first key in the new
+	// output, or nil if this sstable will only contain range tombstones already
+	// in the fragmenter.
+	onNewOutput(key *InternalKey) []byte
+}
+
+// fileSizeSplitter is a compactionOutputSplitter that makes a determination
+// to split outputs based on the estimated file size of the current output.
+// Note that, unlike most other splitters, this splitter does not guarantee
+// that it will advise splits only at user key change boundaries.
+type fileSizeSplitter struct {
+	maxFileSize uint64
+}
+
+func (f *fileSizeSplitter) shouldSplitBefore(
+	key *InternalKey, tw *sstable.Writer,
+) compactionSplitSuggestion {
+	// The Kind != RangeDelete part exists because EstimatedSize doesn't grow
+	// rightaway when a range tombstone is added to the fragmenter. It's always
+	// better to make a sequence of range tombstones visible to the fragmenter.
+	if key.Kind() != InternalKeyKindRangeDelete && tw != nil &&
+		tw.EstimatedSize() >= f.maxFileSize {
+		return splitNow
+	}
+	return noSplit
+}
+
+func (f *fileSizeSplitter) onNewOutput(key *InternalKey) []byte {
+	return nil
+}
+
+type grandparentLimitSplitter struct {
+	c     *compaction
+	ve    *versionEdit
+	limit []byte
+}
+
+func (g *grandparentLimitSplitter) shouldSplitBefore(
+	key *InternalKey, tw *sstable.Writer,
+) compactionSplitSuggestion {
+	if g.limit != nil && g.c.cmp(key.UserKey, g.limit) > 0 {
+		return splitNow
+	}
+	return noSplit
+}
+
+func (g *grandparentLimitSplitter) onNewOutput(key *InternalKey) []byte {
+	g.limit = nil
+	if g.c.rangeDelFrag.Empty() || len(g.ve.NewFiles) == 0 {
+		// In this case, `limit` will be a larger user key than `key.UserKey`, or
+		// nil. In either case, the inner loop will execute at least once to
+		// process `key`, and the input iterator will be advanced.
+		if key != nil {
+			g.limit = g.c.findGrandparentLimit(key.UserKey)
+		} else { // !c.rangeDelFrag.Empty()
+			g.limit = g.c.findGrandparentLimit(g.c.rangeDelFrag.Start())
+		}
+	} else {
+		// There is a range tombstone spanning from the last file into the
+		// current one. Therefore this file's smallest boundary will overlap the
+		// last file's largest boundary.
+		//
+		// In this case, `limit` will be a larger user key than the previous
+		// file's largest key and correspond to a grandparent file's largest user
+		// key, or nil. Then, it is possible the inner loop executes zero times,
+		// and the output file contains only range tombstones. That is fine as
+		// long as the number of times we execute this case is bounded. Since
+		// `findGrandparentLimit()` returns a strictly larger user key each time
+		// and it corresponds to a grandparent file largest key, the number of
+		// times this case can execute is bounded by the number of grandparent
+		// files (plus one for the final time it returns nil).
+		//
+		// n > 0 since we cannot have seen range tombstones at the
+		// beginning of the first file.
+		n := len(g.ve.NewFiles)
+		g.limit = g.c.findGrandparentLimit(g.ve.NewFiles[n-1].Meta.Largest.UserKey)
+		// This conditional is necessary to maintain the invariant that
+		// successive calls to finishOutput() have an increasing
+		// limit, and that the fragmenter's *FlushTo() and Add() calls are
+		// always made with successively increasing user keys. It's possible
+		// for the last file's Meta.Largest.UserKey
+		// to be substantially less than the last key returned by
+		// the compactionIter, such as in a sequence of consecutive
+		// rangedel tombstones, of which some but not all get elided.
+		// Consider this example:
+		//
+		// Compaction input (all range tombstones in this snippet):
+		// a-b
+		// c-d
+		// e-f  (elided)
+		// g-h  (elided) <-- grandparent limit before this (at ff)
+		// i-j  (elided)
+		// k-q           <-- grandparent limit at k
+		// m-q
+		//
+		// Note that elided tombstones are added to the fragmenter, but
+		// removed before they make their way from the fragmenter onto
+		// iter.tombstones. They still affect the fragmenter's internal
+		// tracking of the key up to which all tombstones have been flushed.
+		// After the first output is cut with limit = g, the fragmenter
+		// is empty, so the next grandparent calculation happens with
+		// key = g, and returns k. We continue adding range tombstones to
+		// the fragmenter between [g,k], which includes k-q as we only
+		// switch outputs after the limit is exceeded. So key = m and
+		// limit = k when finishOutput is called. Since the start key in
+		// the fragmenter (k) matches the limit, and no point keys were
+		// added, we actually don't produce a new output (see the
+		// conditional in finishOutput() on why).
+		//
+		// When we try to calculate the next grandparent limit, since
+		// c.rangeDelFrag.Empty() == false (as k-q is sitting in it),
+		// we fall into this case, and use the end key of the last written
+		// sstable (which was [a-d]) to calculate the grandparent limit.
+		// That gets us g again, which gets us to call
+		// c.rangeDelFrag.FlushTo(g), which violates the
+		// invariant that the current flush-to key (g) be greater than the
+		// last one (k).
+		//
+		// To solve this, if the grandparent limit falls "in between"
+		// ve.NewFiles[n-1].Meta.Largest.UserKey and c.rangeDelFrag.Start(),
+		// re-calculate a higher limit ahead of that key.
+		if g.c.rangeDelFrag.Start() != nil && g.c.cmp(g.limit, g.c.rangeDelFrag.Start()) <= 0 {
+			g.limit = g.c.findGrandparentLimit(g.c.rangeDelFrag.Start())
+		}
+	}
+	return g.limit
+}
+
+type l0LimitSplitter struct {
+	c     *compaction
+	ve    *versionEdit
+	limit []byte
+}
+
+func (l *l0LimitSplitter) shouldSplitBefore(
+	key *InternalKey, tw *sstable.Writer,
+) compactionSplitSuggestion {
+	if l.limit != nil && l.c.cmp(key.UserKey, l.limit) > 0 {
+		return splitNow
+	}
+	return noSplit
+}
+
+func (l *l0LimitSplitter) onNewOutput(key *InternalKey) []byte {
+	l.limit = nil
+	// For flushes being split across multiple sstables, call
+	// findL0Limit to find the next L0 limit.
+	if key != nil {
+		l.limit = l.c.findL0Limit(key.UserKey)
+	} else {
+		// Use the start key of the first pending tombstone to find the
+		// next limit. All pending tombstones have the same start key.
+		// We use this as opposed to the end key of the
+		// last written sstable to effectively handle cases like these:
+		//
+		// a.SET.3
+		// (L0 limit at b)
+		// d.RANGEDEL.4:f
+		//
+		// In this case, the partition after b has only range deletions,
+		// so if we were to find the L0 limit after the last written
+		// key at the split point (key a), we'd get the limit b again,
+		// and finishOutput() would not advance any further because
+		// the next range tombstone to write does not start until after
+		// the L0 split point.
+		startKey := l.c.rangeDelFrag.Start()
+		if startKey != nil {
+			l.limit = l.c.findL0Limit(startKey)
+		}
+	}
+	return l.limit
+}
+
+// splitterGroup is a compactionOutputSplitter that splits whenever one of its
+// child splitters advises a compaction split.
+type splitterGroup struct {
+	cmp       Compare
+	splitters []compactionOutputSplitter
+}
+
+func (a *splitterGroup) shouldSplitBefore(
+	key *InternalKey, tw *sstable.Writer,
+) (suggestion compactionSplitSuggestion) {
+	suggestion = noSplit
+	for _, splitter := range a.splitters {
+		switch splitter.shouldSplitBefore(key, tw) {
+		case splitNow:
+			return splitNow
+		case splitSoon:
+			suggestion = splitSoon
+		}
+	}
+	return suggestion
+}
+
+func (a *splitterGroup) onNewOutput(key *InternalKey) []byte {
+	var earliestLimit []byte
+	for _, splitter := range a.splitters {
+		limit := splitter.onNewOutput(key)
+		if limit == nil {
+			continue
+		}
+		if earliestLimit == nil || a.cmp(limit, earliestLimit) < 0 {
+			earliestLimit = limit
+		}
+	}
+	return earliestLimit
+}
+
+// userKeyChangeSplitter is a compactionOutputSplitter that takes in a child
+// splitter, and splits when 1) that child splitter has advised a split, and 2)
+// the compaction output is at the boundary between two user keys (also
+// the boundary between atomic compaction units). Use this splitter to wrap
+// any splitters that don't guarantee user key splits (i.e. splitters that make
+// their determinatino in ways other than comparing the current key against a
+// limit key.
+type userKeyChangeSplitter struct {
+	cmp                Compare
+	splitOnNextUserKey bool
+	savedKey           []byte
+	splitter           compactionOutputSplitter
+}
+
+func (u *userKeyChangeSplitter) shouldSplitBefore(
+	key *InternalKey, tw *sstable.Writer,
+) compactionSplitSuggestion {
+	if u.splitOnNextUserKey && u.cmp(u.savedKey, key.UserKey) != 0 {
+		u.splitOnNextUserKey = false
+		u.savedKey = u.savedKey[:0]
+		return splitNow
+	}
+	if split := u.splitter.shouldSplitBefore(key, tw); split == splitNow {
+		u.splitOnNextUserKey = true
+		u.savedKey = append(u.savedKey[:0], key.UserKey...)
+		return noSplit
+	}
+	return noSplit
+}
+
+func (u *userKeyChangeSplitter) onNewOutput(key *InternalKey) []byte {
+	return u.splitter.onNewOutput(key)
+}
+
+// nonZeroSeqNumSplitter is a compactionOutputSplitter that takes in a child
+// splitter, and advises a split when 1) that child splitter advises a split,
+// and 2) the compaction output is at a point where the previous point sequence
+// number is nonzero.
+type nonZeroSeqNumSplitter struct {
+	c                    *compaction
+	splitter             compactionOutputSplitter
+	prevPointSeqNum      uint64
+	splitOnNonZeroSeqNum bool
+}
+
+func (n *nonZeroSeqNumSplitter) shouldSplitBefore(
+	key *InternalKey, tw *sstable.Writer,
+) compactionSplitSuggestion {
+	curSeqNum := key.SeqNum()
+	keyKind := key.Kind()
+	prevPointSeqNum := n.prevPointSeqNum
+	if keyKind != InternalKeyKindRangeDelete {
+		n.prevPointSeqNum = curSeqNum
+	}
+
+	if n.splitOnNonZeroSeqNum {
+		if prevPointSeqNum > 0 || n.c.rangeDelFrag.Empty() {
+			n.splitOnNonZeroSeqNum = false
+			return splitNow
+		}
+	} else if split := n.splitter.shouldSplitBefore(key, tw); split == splitNow {
+		userKeyChange := curSeqNum > prevPointSeqNum
+		if prevPointSeqNum > 0 || n.c.rangeDelFrag.Empty() || userKeyChange {
+			return splitNow
+		}
+		n.splitOnNonZeroSeqNum = true
+		return splitSoon
+	}
+	return noSplit
+}
+
+func (n *nonZeroSeqNumSplitter) onNewOutput(key *InternalKey) []byte {
+	n.prevPointSeqNum = InternalKeySeqNumMax
+	n.splitOnNonZeroSeqNum = false
+	return n.splitter.onNewOutput(key)
+}
+
+// compactionFile is a vfs.File wrapper that, on every write, updates a metric
+// in `versions` on bytes written by in-progress compactions so far. It also
+// increments a per-compaction `written` int.
+type compactionFile struct {
+	vfs.File
+
+	versions *versionSet
+	written  *int64
+}
+
+// Write implements the io.Writer interface.
+func (c *compactionFile) Write(p []byte) (n int, err error) {
+	n, err = c.File.Write(p)
+	if err != nil {
+		return n, err
+	}
+
+	*c.written += int64(n)
+	c.versions.incrementCompactionBytes(int64(n))
+	return n, err
+}
+
 type compactionKind string
 
 const (
 	compactionKindDefault     compactionKind = "default"
-	compactionKindFlush                      = "flush"
-	compactionKindMove                       = "move"
-	compactionKindDeleteOnly                 = "delete-only"
-	compactionKindElisionOnly                = "elision-only"
+	compactionKindFlush       compactionKind = "flush"
+	compactionKindMove        compactionKind = "move"
+	compactionKindDeleteOnly  compactionKind = "delete-only"
+	compactionKindElisionOnly compactionKind = "elision-only"
 )
 
 // compaction is a table compaction from one level to the next, starting from a
@@ -103,10 +450,6 @@ type compaction struct {
 	// maxOverlapBytes is the maximum number of bytes of overlap allowed for a
 	// single output table with the tables in the grandparent level.
 	maxOverlapBytes uint64
-	// maxExpandedBytes is the maximum size of an expanded compaction. If growing
-	// a compaction results in a larger size, the original compaction is used
-	// instead.
-	maxExpandedBytes uint64
 	// disableRangeTombstoneElision disables elision of range tombstones. Used by
 	// tests to allow range tombstones to be added to tables where they would
 	// otherwise be elided.
@@ -116,6 +459,8 @@ type compaction struct {
 	flushing flushableList
 	// bytesIterated contains the number of bytes that have been flushed/compacted.
 	bytesIterated uint64
+	// bytesWritten contains the number of bytes that have been written to outputs.
+	bytesWritten int64
 	// atomicBytesIterated points to the variable to increment during iteration.
 	// atomicBytesIterated must be read/written atomically. Flushing will increment
 	// the shared variable which compaction will read. This allows for the
@@ -205,7 +550,6 @@ func newCompaction(pc *pickedCompaction, opts *Options, bytesCompacted *uint64) 
 		version:             pc.version,
 		maxOutputFileSize:   pc.maxOutputFileSize,
 		maxOverlapBytes:     pc.maxOverlapBytes,
-		maxExpandedBytes:    pc.maxOverlapBytes,
 		atomicBytesIterated: bytesCompacted,
 	}
 	c.startLevel = &c.inputs[0]
@@ -253,6 +597,73 @@ func newDeleteOnlyCompaction(opts *Options, cur *version, inputs []compactionLev
 	return c
 }
 
+func adjustGrandparentOverlapBytesForFlush(c *compaction, flushingBytes uint64) {
+	// Heuristic to place a lower bound on compaction output file size
+	// caused by Lbase. Prior to this heuristic we have observed an L0 in
+	// production with 310K files of which 290K files were < 10KB in size.
+	// Our hypothesis is that it was caused by L1 having 2600 files and
+	// ~10GB, such that each flush got split into many tiny files due to
+	// overlapping with most of the files in Lbase.
+	//
+	// The computation below is general in that it accounts
+	// for flushing different volumes of data (e.g. we may be flushing
+	// many memtables). For illustration, we consider the typical
+	// example of flushing a 64MB memtable. So 12.8MB output,
+	// based on the compression guess below. If the compressed bytes
+	// guess is an over-estimate we will end up with smaller files,
+	// and if an under-estimate we will end up with larger files.
+	// With a 2MB target file size, 7 files. We are willing to accept
+	// 4x the number of files, if it results in better write amplification
+	// when later compacting to Lbase, i.e., ~450KB files (target file
+	// size / 4).
+	//
+	// Note that this is a pessimistic heuristic in that
+	// fileCountUpperBoundDueToGrandparents could be far from the actual
+	// number of files produced due to the grandparent limits. For
+	// example, in the extreme, consider a flush that overlaps with 1000
+	// files in Lbase f0...f999, and the initially calculated value of
+	// maxOverlapBytes will cause splits at f10, f20,..., f990, which
+	// means an upper bound file count of 100 files. Say the input bytes
+	// in the flush are such that acceptableFileCount=10. We will fatten
+	// up maxOverlapBytes by 10x to ensure that the upper bound file count
+	// drops to 10. However, it is possible that in practice, even without
+	// this change, we would have produced no more than 10 files, and that
+	// this change makes the files unnecessarily wide. Say the input bytes
+	// are distributed such that 10% are in f0...f9, 10% in f10...f19, ...
+	// 10% in f80...f89 and 10% in f990...f999. The original value of
+	// maxOverlapBytes would have actually produced only 10 sstables. But
+	// by increasing maxOverlapBytes by 10x, we may produce 1 sstable that
+	// spans f0...f89, i.e., a much wider sstable than necessary.
+	//
+	// We could produce a tighter estimate of
+	// fileCountUpperBoundDueToGrandparents if we had knowledge of the key
+	// distribution of the flush. The 4x multiplier mentioned earlier is
+	// a way to try to compensate for this pessimism.
+	//
+	// TODO(sumeer): we don't have compression info for the data being
+	// flushed, but it is likely that existing files that overlap with
+	// this flush in Lbase are representative wrt compression ratio. We
+	// could store the uncompressed size in FileMetadata and estimate
+	// the compression ratio.
+	const approxCompressionRatio = 0.2
+	approxOutputBytes := approxCompressionRatio * float64(flushingBytes)
+	approxNumFilesBasedOnTargetSize :=
+		int(math.Ceil(approxOutputBytes / float64(c.maxOutputFileSize)))
+	acceptableFileCount := float64(4 * approxNumFilesBasedOnTargetSize)
+	// The byte calculation is linear in numGrandparentFiles, but we will
+	// incur this linear cost in findGrandparentLimit too, so we are also
+	// willing to pay it now. We could approximate this cheaply by using
+	// the mean file size of Lbase.
+	grandparentFileBytes := c.grandparents.SizeSum()
+	fileCountUpperBoundDueToGrandparents :=
+		float64(grandparentFileBytes) / float64(c.maxOverlapBytes)
+	if fileCountUpperBoundDueToGrandparents > acceptableFileCount {
+		c.maxOverlapBytes = uint64(
+			float64(c.maxOverlapBytes) *
+				(fileCountUpperBoundDueToGrandparents / acceptableFileCount))
+	}
+}
+
 func newFlush(
 	opts *Options, cur *version, baseLevel int, flushing flushableList, bytesFlushed *uint64,
 ) *compaction {
@@ -265,7 +676,6 @@ func newFlush(
 		inputs:              []compactionLevel{{level: -1}, {level: 0}},
 		maxOutputFileSize:   math.MaxUint64,
 		maxOverlapBytes:     math.MaxUint64,
-		maxExpandedBytes:    math.MaxUint64,
 		flushing:            flushing,
 		atomicBytesIterated: bytesFlushed,
 	}
@@ -314,20 +724,22 @@ func newFlush(
 		}
 	}
 
+	var flushingBytes uint64
 	for i := range flushing {
 		f := flushing[i]
 		updatePointBounds(f.newIter(nil))
 		if rangeDelIter := f.newRangeDelIter(nil); rangeDelIter != nil {
 			updateRangeBounds(rangeDelIter)
 		}
+		flushingBytes += f.inuseBytes()
 	}
 
-	if opts.Experimental.FlushSplitBytes > 0 {
+	if opts.FlushSplitBytes > 0 {
 		c.maxOutputFileSize = uint64(opts.Level(0).TargetFileSize)
 		c.maxOverlapBytes = maxGrandparentOverlapBytes(opts, 0)
-		c.maxExpandedBytes = expandedCompactionByteSizeLimit(opts, 0)
 		c.grandparents = c.version.Overlaps(baseLevel, c.cmp,
 			c.smallest.UserKey, c.largest.UserKey)
+		adjustGrandparentOverlapBytesForFlush(c, flushingBytes)
 	}
 
 	c.setupInuseKeyRanges()
@@ -346,7 +758,8 @@ func (c *compaction) setupInuseKeyRanges() {
 	// levels.
 	var input []userKeyRange
 	for ; level < numLevels; level++ {
-		iter := c.version.Overlaps(level, c.cmp, c.smallest.UserKey, c.largest.UserKey).Iter()
+		overlaps := c.version.Overlaps(level, c.cmp, c.smallest.UserKey, c.largest.UserKey)
+		iter := overlaps.Iter()
 		for m := iter.First(); m != nil; m = iter.Next() {
 			input = append(input, userKeyRange{m.Smallest.UserKey, m.Largest.UserKey})
 		}
@@ -411,21 +824,38 @@ func (c *compaction) findGrandparentLimit(start []byte) []byte {
 }
 
 // findL0Limit takes the start key for a table and returns the user key to which
-// that table can be extended without excessively overlapping the grandparent
-// level, or hitting the next l0Limit, whichever happens sooner. For non-flushes
-// this function passes through to findGrandparentLimit.
+// that table can be extended without hitting the next l0Limit. Having flushed
+// sstables "bridging across" an l0Limit could lead to increased L0 -> LBase
+// compaction sizes as well as elevated read amplification.
 func (c *compaction) findL0Limit(start []byte) []byte {
-	grandparentLimit := c.findGrandparentLimit(start)
 	if c.startLevel.level > -1 || c.outputLevel.level != 0 || len(c.l0Limits) == 0 {
-		return grandparentLimit
+		return nil
 	}
 	index := sort.Search(len(c.l0Limits), func(i int) bool {
 		return c.cmp(c.l0Limits[i], start) > 0
 	})
-	if index < len(c.l0Limits) && (grandparentLimit == nil || c.cmp(c.l0Limits[index], grandparentLimit) < 0) {
+	if index < len(c.l0Limits) {
 		return c.l0Limits[index]
 	}
-	return grandparentLimit
+	return nil
+}
+
+// errorOnUserKeyOverlap returns an error if the last two written sstables in
+// this compaction have revisions of the same user key present in both sstables,
+// when it shouldn't (eg. when splitting flushes).
+func (c *compaction) errorOnUserKeyOverlap(ve *versionEdit) error {
+	if n := len(ve.NewFiles); n > 1 {
+		meta := ve.NewFiles[n-1].Meta
+		prevMeta := ve.NewFiles[n-2].Meta
+		if prevMeta.Largest.Trailer != InternalKeyRangeDeleteSentinel &&
+			c.cmp(prevMeta.Largest.UserKey, meta.Smallest.UserKey) >= 0 {
+			return errors.Errorf("pebble: compaction split user key across two sstables: %s in %s and %s",
+				prevMeta.Largest.Pretty(c.formatKey),
+				prevMeta.FileNum,
+				meta.FileNum)
+		}
+	}
+	return nil
 }
 
 // allowZeroSeqNum returns true if seqnum's can be zeroed if there are no
@@ -552,7 +982,7 @@ func (c *compaction) newInputIter(newIters tableNewIters) (_ internalIterator, r
 	newRangeDelIter := func(
 		f manifest.LevelFile, _ *IterOptions, bytesIterated *uint64,
 	) (internalIterator, internalIterator, error) {
-		iter, rangeDelIter, err := newIters(f, nil /* iter options */, &c.bytesIterated)
+		iter, rangeDelIter, err := newIters(f.FileMetadata, nil /* iter options */, &c.bytesIterated)
 		if err == nil {
 			// TODO(peter): It is mildly wasteful to open the point iterator only to
 			// immediately close it. One way to solve this would be to add new
@@ -579,7 +1009,7 @@ func (c *compaction) newInputIter(newIters tableNewIters) (_ internalIterator, r
 			// boundaries at write time. Because we're doing the truncation at read
 			// time, we follow RocksDB's lead and do not truncate tombstones to
 			// atomic unit boundaries at compaction time.
-			atomicUnit := expandToAtomicUnit(c.cmp, f.Slice())
+			atomicUnit, _ := expandToAtomicUnit(c.cmp, f.Slice(), true /* disableIsCompacting */)
 			lowerBound, upperBound := manifest.KeyRange(c.cmp, atomicUnit.Iter())
 			// Range deletion tombstones are often written to sstables
 			// untruncated on the end key side. However, they are still only
@@ -651,7 +1081,7 @@ func (c *compaction) newInputIter(newIters tableNewIters) (_ internalIterator, r
 	} else {
 		iter := c.startLevel.files.Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
-			iter, rangeDelIter, err := newIters(iter.Take(), nil /* iter options */, &c.bytesIterated)
+			iter, rangeDelIter, err := newIters(iter.Current(), nil /* iter options */, &c.bytesIterated)
 			if err != nil {
 				return nil, errors.Wrapf(err, "pebble: could not open table %s", errors.Safe(f.FileNum))
 			}
@@ -699,6 +1129,14 @@ type manualCompaction struct {
 	done        chan error
 	start       InternalKey
 	end         InternalKey
+}
+
+type readCompaction struct {
+	level int
+	// Key ranges are used instead of file handles as versions could change
+	// between the read sampling and scheduling a compaction.
+	start []byte
+	end   []byte
 }
 
 func (d *DB) addInProgressCompaction(c *compaction) {
@@ -767,18 +1205,20 @@ func (d *DB) removeInProgressCompaction(c *compaction) {
 		iter := cl.files.Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
 			if !f.Compacting {
-				d.opts.Logger.Fatalf("L%d->L%d: %s already being compacted", c.startLevel.level, c.outputLevel.level, f.FileNum)
+				d.opts.Logger.Fatalf("L%d->L%d: %s not being compacted", c.startLevel.level, c.outputLevel.level, f.FileNum)
 			}
 			f.Compacting = false
 			f.IsIntraL0Compacting = false
 		}
 	}
 	delete(d.mu.compact.inProgress, c)
-	d.mu.versions.currentVersion().L0Sublevels.InitCompactingFileInfo()
+
+	l0InProgress := inProgressL0Compactions(d.getInProgressCompactionInfoLocked(c))
+	d.mu.versions.currentVersion().L0Sublevels.InitCompactingFileInfo(l0InProgress)
 }
 
 func (d *DB) getCompactionPacerInfo() compactionPacerInfo {
-	bytesFlushed := atomic.LoadUint64(&d.bytesFlushed)
+	bytesFlushed := atomic.LoadUint64(&d.atomic.bytesFlushed)
 
 	d.mu.Lock()
 	estimatedMaxWAmp := d.mu.versions.picker.getEstimatedMaxWAmp()
@@ -804,6 +1244,22 @@ func (d *DB) getFlushPacerInfo() flushPacerInfo {
 	return pacerInfo
 }
 
+func (d *DB) getDeletionPacerInfo() deletionPacerInfo {
+	var pacerInfo deletionPacerInfo
+	// Call GetFreeSpace after every file deletion. This may seem inefficient,
+	// but in practice this was observed to take constant time, regardless of
+	// volume size used, at least on linux with ext4 and zfs. All invocations
+	// take 10 microseconds or less.
+	if space, err := d.opts.FS.GetFreeSpace(d.dirname); err == nil {
+		pacerInfo.freeBytes = space
+	}
+	d.mu.Lock()
+	pacerInfo.obsoleteBytes = d.mu.versions.metrics.Table.ObsoleteSize
+	pacerInfo.liveBytes = uint64(d.mu.versions.metrics.Total().Size)
+	d.mu.Unlock()
+	return pacerInfo
+}
+
 // maybeScheduleFlush schedules a flush if necessary.
 //
 // d.mu must be held when calling this.
@@ -815,6 +1271,15 @@ func (d *DB) maybeScheduleFlush() {
 		return
 	}
 
+	if !d.passedFlushThreshold() {
+		return
+	}
+
+	d.mu.compact.flushing = true
+	go d.flush()
+}
+
+func (d *DB) passedFlushThreshold() bool {
 	var n int
 	var size uint64
 	for ; n < len(d.mu.mem.queue)-1; n++ {
@@ -831,7 +1296,7 @@ func (d *DB) maybeScheduleFlush() {
 	}
 	if n == 0 {
 		// None of the immutable memtables are ready for flushing.
-		return
+		return false
 	}
 
 	// Only flush once the sum of the queued memtable sizes exceeds half the
@@ -840,11 +1305,10 @@ func (d *DB) maybeScheduleFlush() {
 	// DB.newMemTable().
 	minFlushSize := uint64(d.opts.MemTableSize) / 2
 	if size < minFlushSize {
-		return
+		return false
 	}
 
-	d.mu.compact.flushing = true
-	go d.flush()
+	return true
 }
 
 func (d *DB) maybeScheduleDelayedFlush(tbl *memTable) {
@@ -943,7 +1407,7 @@ func (d *DB) flush1() error {
 	}
 
 	c := newFlush(d.opts, d.mu.versions.currentVersion(),
-		d.mu.versions.picker.getBaseLevel(), d.mu.mem.queue[:n], &d.bytesFlushed)
+		d.mu.versions.picker.getBaseLevel(), d.mu.mem.queue[:n], &d.atomic.bytesFlushed)
 	d.addInProgressCompaction(c)
 
 	jobID := d.mu.nextJobID
@@ -997,16 +1461,18 @@ func (d *DB) flush1() error {
 		if err != nil {
 			// TODO(peter): untested.
 			d.mu.versions.obsoleteTables = append(d.mu.versions.obsoleteTables, pendingOutputs...)
+			d.mu.versions.incrementObsoleteTablesLocked(pendingOutputs)
 		}
 	}
 
 	d.maybeUpdateDeleteCompactionHints(c)
 	d.removeInProgressCompaction(c)
+	d.mu.versions.incrementCompactionBytes(-c.bytesWritten)
 	d.mu.versions.incrementFlushes()
 	d.opts.EventListener.FlushEnd(info)
 
 	// Refresh bytes flushed count.
-	atomic.StoreUint64(&d.bytesFlushed, 0)
+	atomic.StoreUint64(&d.atomic.bytesFlushed, 0)
 
 	var flushed flushableList
 	if err == nil {
@@ -1053,7 +1519,9 @@ func pickElisionOnly(picker compactionPicker, env compactionEnv) *pickedCompacti
 // calling `pickFunc` to pick automatic compactions.
 //
 // d.mu must be held when calling this.
-func (d *DB) maybeScheduleCompactionPicker(pickFunc func(compactionPicker, compactionEnv) *pickedCompaction) {
+func (d *DB) maybeScheduleCompactionPicker(
+	pickFunc func(compactionPicker, compactionEnv) *pickedCompaction,
+) {
 	if d.closed.Load() != nil || d.opts.ReadOnly {
 		return
 	}
@@ -1079,7 +1547,7 @@ func (d *DB) maybeScheduleCompactionPicker(pickFunc func(compactionPicker, compa
 	}
 
 	env := compactionEnv{
-		bytesCompacted:          &d.bytesCompacted,
+		bytesCompacted:          &d.atomic.bytesCompacted,
 		earliestSnapshotSeqNum:  d.mu.snapshots.earliest(),
 		earliestUnflushedSeqNum: d.getEarliestUnflushedSeqNumLocked(),
 	}
@@ -1125,6 +1593,10 @@ func (d *DB) maybeScheduleCompactionPicker(pickFunc func(compactionPicker, compa
 
 	for !d.opts.private.disableAutomaticCompactions && d.mu.compact.compactingCount < d.opts.MaxConcurrentCompactions {
 		env.inProgressCompactions = d.getInProgressCompactionInfoLocked(nil)
+		env.readCompactionEnv = readCompactionEnv{
+			readCompactions: &d.mu.compact.readCompactions,
+			flushing:        d.mu.compact.flushing || d.passedFlushThreshold(),
+		}
 		pc := pickFunc(d.mu.versions.picker, env)
 		if pc == nil {
 			break
@@ -1303,8 +1775,9 @@ func checkDeleteCompactionHints(
 		// The hint h will be resolved and dropped, regardless of whether
 		// there are any tables that can be deleted.
 		for l := h.tombstoneLevel + 1; l < numLevels; l++ {
-			overlaps := v.Overlaps(l, cmp, h.start, h.end).Iter()
-			for m := overlaps.First(); m != nil; m = overlaps.Next() {
+			overlaps := v.Overlaps(l, cmp, h.start, h.end)
+			iter := overlaps.Iter()
+			for m := iter.First(); m != nil; m = iter.Next() {
 				if m.Compacting || !h.canDelete(cmp, m, snapshots) || files[m] {
 					continue
 				}
@@ -1327,7 +1800,7 @@ func checkDeleteCompactionHints(
 		}
 		compactLevels = append(compactLevels, compactionLevel{
 			level: l,
-			files: manifest.NewLevelSlice(files),
+			files: manifest.NewLevelSliceKeySorted(cmp, files),
 		})
 	}
 	return compactLevels, unresolvedHints
@@ -1388,6 +1861,7 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 		if err != nil {
 			// TODO(peter): untested.
 			d.mu.versions.obsoleteTables = append(d.mu.versions.obsoleteTables, pendingOutputs...)
+			d.mu.versions.incrementObsoleteTablesLocked(pendingOutputs)
 		}
 	}
 
@@ -1403,6 +1877,7 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 	d.maybeUpdateDeleteCompactionHints(c)
 	d.removeInProgressCompaction(c)
 	d.mu.versions.incrementCompactions()
+	d.mu.versions.incrementCompactionBytes(-c.bytesWritten)
 	d.opts.EventListener.CompactionEnd(info)
 
 	// Update the read state before deleting obsolete files because the
@@ -1425,13 +1900,13 @@ func (d *DB) compact1(c *compaction, errChannel chan error) (err error) {
 // re-acquired during the course of this method.
 func (d *DB) runCompaction(
 	jobID int, c *compaction, pacer pacer,
-) (ve *versionEdit, pendingOutputs []FileNum, retErr error) {
+) (ve *versionEdit, pendingOutputs []*fileMetadata, retErr error) {
 	// Check for a delete-only compaction. This can occur when wide range
 	// tombstones completely contain sstables.
 	if c.kind == compactionKindDeleteOnly {
 		c.metrics = make(map[int]*LevelMetrics, len(c.inputs))
 		ve := &versionEdit{
-			DeletedFiles: map[deletedFileEntry]bool{},
+			DeletedFiles: map[deletedFileEntry]*fileMetadata{},
 		}
 		for _, cl := range c.inputs {
 			levelMetrics := &LevelMetrics{}
@@ -1442,7 +1917,7 @@ func (d *DB) runCompaction(
 				ve.DeletedFiles[deletedFileEntry{
 					Level:   cl.level,
 					FileNum: f.FileNum,
-				}] = true
+				}] = f
 			}
 			c.metrics[cl.level] = levelMetrics
 		}
@@ -1457,11 +1932,11 @@ func (d *DB) runCompaction(
 		iter := c.startLevel.files.Iter()
 		meta := iter.First()
 		c.metrics = map[int]*LevelMetrics{
-			c.startLevel.level: &LevelMetrics{
+			c.startLevel.level: {
 				NumFiles: -1,
 				Size:     -int64(meta.Size),
 			},
-			c.outputLevel.level: &LevelMetrics{
+			c.outputLevel.level: {
 				NumFiles:    1,
 				Size:        int64(meta.Size),
 				BytesMoved:  meta.Size,
@@ -1469,8 +1944,8 @@ func (d *DB) runCompaction(
 			},
 		}
 		ve := &versionEdit{
-			DeletedFiles: map[deletedFileEntry]bool{
-				deletedFileEntry{Level: c.startLevel.level, FileNum: meta.FileNum}: true,
+			DeletedFiles: map[deletedFileEntry]*fileMetadata{
+				{Level: c.startLevel.level, FileNum: meta.FileNum}: meta,
 			},
 			NewFiles: []newFileEntry{
 				{Level: c.outputLevel.level, Meta: meta},
@@ -1522,7 +1997,7 @@ func (d *DB) runCompaction(
 	}()
 
 	ve = &versionEdit{
-		DeletedFiles: map[deletedFileEntry]bool{},
+		DeletedFiles: map[deletedFileEntry]*fileMetadata{},
 	}
 
 	outputMetrics := &LevelMetrics{
@@ -1540,9 +2015,11 @@ func (d *DB) runCompaction(
 	writerOpts := d.opts.MakeWriterOptions(c.outputLevel.level)
 
 	newOutput := func() error {
+		fileMeta := &fileMetadata{}
 		d.mu.Lock()
 		fileNum := d.mu.versions.getNextFileNum()
-		pendingOutputs = append(pendingOutputs, fileNum)
+		fileMeta.FileNum = fileNum
+		pendingOutputs = append(pendingOutputs, fileMeta)
 		d.mu.Unlock()
 
 		filename := base.MakeFilename(d.opts.FS, d.dirname, fileTypeTable, fileNum)
@@ -1563,22 +2040,25 @@ func (d *DB) runCompaction(
 		file = vfs.NewSyncingFile(file, vfs.SyncingFileOptions{
 			BytesPerSync: d.opts.BytesPerSync,
 		})
+		file = &compactionFile{
+			File:     file,
+			versions: d.mu.versions,
+			written:  &c.bytesWritten,
+		}
 		filenames = append(filenames, filename)
 		cacheOpts := private.SSTableCacheOpts(d.cacheID, fileNum).(sstable.WriterOption)
 		internalTableOpt := private.SSTableInternalTableOpt.(sstable.WriterOption)
 		tw = sstable.NewWriter(file, writerOpts, cacheOpts, internalTableOpt)
 
+		fileMeta.CreationTime = time.Now().Unix()
 		ve.NewFiles = append(ve.NewFiles, newFileEntry{
 			Level: c.outputLevel.level,
-			Meta: &fileMetadata{
-				FileNum:      fileNum,
-				CreationTime: time.Now().Unix(),
-			},
+			Meta:  fileMeta,
 		})
 		return nil
 	}
 
-	splittingFlush := c.startLevel.level < 0 && c.outputLevel.level == 0 && d.opts.Experimental.FlushSplitBytes > 0
+	splitL0Outputs := c.outputLevel.level == 0 && d.opts.FlushSplitBytes > 0
 
 	// finishOutput is called for an sstable with the first key of the next sstable, and for the
 	// last sstable with an empty key.
@@ -1587,9 +2067,11 @@ func (d *DB) runCompaction(
 		// then the sstable will only contain range tombstones. The smallest
 		// key in the sstable will be the start key of the first range
 		// tombstone added. We need to ensure that this start key is distinct
-		// from the limit (key) passed to finishOutput, otherwise we would
-		// generate an sstable where the largest key is smaller than the
+		// from the limit (key) passed to finishOutput (if set), otherwise we
+		// would generate an sstable where the largest key is smaller than the
 		// smallest key due to how the largest key boundary is set below.
+		// NB: It is permissible for the range tombstone start key to be the
+		// empty string.
 		// TODO: It is unfortunate that we have to do this check here rather
 		// than when we decide to finish the sstable in the runCompaction
 		// loop. A better structure currently eludes us.
@@ -1598,7 +2080,7 @@ func (d *DB) runCompaction(
 			if len(iter.tombstones) > 0 {
 				startKey = iter.tombstones[0].Start.UserKey
 			}
-			if d.cmp(startKey, key) == 0 {
+			if key != nil && d.cmp(startKey, key) == 0 {
 				return nil
 			}
 		}
@@ -1606,7 +2088,7 @@ func (d *DB) runCompaction(
 		// NB: clone the key because the data can be held on to by the call to
 		// compactionIter.Tombstones via rangedel.Fragmenter.FlushTo.
 		key = append([]byte(nil), key...)
-		for _, v := range iter.Tombstones(key, splittingFlush) {
+		for _, v := range iter.Tombstones(key, splitL0Outputs) {
 			if tw == nil {
 				if err := newOutput(); err != nil {
 					return err
@@ -1659,7 +2141,6 @@ func (d *DB) runCompaction(
 		meta.Size = writerMeta.Size
 		meta.SmallestSeqNum = writerMeta.SmallestSeqNum
 		meta.LargestSeqNum = writerMeta.LargestSeqNum
-		meta.MarkedForCompaction = writerMeta.MarkedForCompaction
 		// If the file didn't contain any range deletions, we can fill its
 		// table stats now, avoiding unnecessarily loading the table later.
 		maybeSetStatsFromProperties(meta, &writerMeta.Properties)
@@ -1775,10 +2256,77 @@ func (d *DB) runCompaction(
 					c.largest.Pretty(d.opts.Comparer.FormatKey))
 			}
 		}
+		// Verify that when splitting an output to L0, we never split different
+		// revisions of the same user key across two different sstables.
+		if splitL0Outputs {
+			if err := c.errorOnUserKeyOverlap(ve); err != nil {
+				return err
+			}
+		}
 		if err := meta.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
 			return err
 		}
 		return nil
+	}
+
+	// compactionOutputSplitters contain all logic to determine whether the
+	// compaction loop should stop writing to one output sstable and switch to
+	// a new one. Some splitters can wrap other splitters, and
+	// the splitterGroup can be composed of multiple splitters. In this case,
+	// we start off with splitters for file sizes, grandparent limits, and (for
+	// L0 splits) L0 limits, before wrapping them in an splitterGroup.
+	//
+	// There is a complication here: we can't split outputs where the largest
+	// key on the left side has a seqnum of zero. This limitation
+	// exists because a range tombstone which extends into the next sstable
+	// will cause the smallest key for the next sstable to have the same user
+	// key, but we need the two tables to be disjoint in key space. Consider
+	// the scenario:
+	//
+	//    a#RANGEDEL-c,3 b#SET,0
+	//
+	// If b#SET,0 is the last key added to an sstable, the range tombstone
+	// [b-c)#3 will extend into the next sstable. The boundary generation
+	// code in finishOutput() will compute the smallest key for that sstable
+	// as b#RANGEDEL,3 which sorts before b#SET,0. Normally we just adjust
+	// the seqnum of this key, but that isn't possible for seqnum 0. To ensure
+	// we only split where the previous point key has a zero seqnum, we wrap
+	// our splitters with a nonZeroSeqNumSplitter.
+	//
+	// Another case where we may not be able to switch SSTables right away is
+	// when we are splitting an L0 output. We do not split the same user key
+	// across different sstables within one flush, so the userKeyChangeSplitter
+	// ensures we are at a user key change boundary when doing a split.
+	outputSplitters := []compactionOutputSplitter{
+		&fileSizeSplitter{maxFileSize: c.maxOutputFileSize},
+		&grandparentLimitSplitter{c: c, ve: ve},
+	}
+	var splitter compactionOutputSplitter
+	if splitL0Outputs {
+		// outputSplitters[0] is the file size splitter, which doesn't guarantee
+		// that all advised splits will be at user key change boundaries. Wrap
+		// it in a userKeyChangeSplitter.
+		outputSplitters[0] = &userKeyChangeSplitter{
+			cmp:      c.cmp,
+			splitter: outputSplitters[0],
+		}
+		outputSplitters = append(outputSplitters, &l0LimitSplitter{c: c, ve: ve})
+	}
+	splitter = &splitterGroup{
+		cmp:       c.cmp,
+		splitters: outputSplitters,
+	}
+	// Compactions to L0 don't need nonzero last-point-key seqnums at split
+	// boundaries because when writing to L0, we are able to guarantee that
+	// the end key of tombstones will also be truncated (through the
+	// TruncateAndFlushTo call), and no user keys will
+	// be split between sstables. So a nonZeroSeqNumSplitter is unnecessary
+	// in that case.
+	if !splitL0Outputs {
+		splitter = &nonZeroSeqNumSplitter{
+			c:        c,
+			splitter: splitter,
+		}
 	}
 
 	// Each outer loop iteration produces one output file. An iteration that
@@ -1790,137 +2338,15 @@ func (d *DB) runCompaction(
 	// progress guarantees ensure that eventually the input iterator will be
 	// exhausted and the range tombstone fragments will all be flushed.
 	for key, val := iter.First(); key != nil || !c.rangeDelFrag.Empty(); {
-		var limit []byte
-		if splittingFlush {
-			// For flushes being split across multiple sstables, call
-			// findL0Limit to find the next L0 limit.
-			if key != nil {
-				limit = c.findL0Limit(key.UserKey)
-			} else {
-				// Use the start key of the first pending tombstone to find the
-				// next limit. All pending tombstones have the same start key.
-				// We use this as opposed to the end key of the
-				// last written sstable to effectively handle cases like these:
-				//
-				// a.SET.3
-				// (L0 limit at b)
-				// d.RANGEDEL.4:f
-				//
-				// In this case, the partition after b has only range deletions,
-				// so if we were to find the L0 limit after the last written
-				// key at the split point (key a), we'd get the limit b again,
-				// and finishOutput() would not advance any further because
-				// the next range tombstone to write does not start until after
-				// the L0 split point.
-				startKey := c.rangeDelFrag.Start()
-				if startKey != nil {
-					limit = c.findL0Limit(startKey)
-				}
-			}
-		} else if c.rangeDelFrag.Empty() || len(ve.NewFiles) == 0 {
-			// In this case, `limit` will be a larger user key than `key.UserKey`, or
-			// nil. In either case, the inner loop will execute at least once to
-			// process `key`, and the input iterator will be advanced.
-			limit = c.findGrandparentLimit(key.UserKey)
-		} else {
-			// There is a range tombstone spanning from the last file into the
-			// current one. Therefore this file's smallest boundary will overlap the
-			// last file's largest boundary.
-			//
-			// In this case, `limit` will be a larger user key than the previous
-			// file's largest key and correspond to a grandparent file's largest user
-			// key, or nil. Then, it is possible the inner loop executes zero times,
-			// and the output file contains only range tombstones. That is fine as
-			// long as the number of times we execute this case is bounded. Since
-			// `findGrandparentLimit()` returns a strictly larger user key each time
-			// and it corresponds to a grandparent file largest key, the number of
-			// times this case can execute is bounded by the number of grandparent
-			// files (plus one for the final time it returns nil).
-			//
-			// n > 0 since we cannot have seen range tombstones at the
-			// beginning of the first file.
-			n := len(ve.NewFiles)
-			limit = c.findGrandparentLimit(ve.NewFiles[n-1].Meta.Largest.UserKey)
-			// This conditional is necessary to maintain the invariant that
-			// successive calls to finishOutput() have an increasing
-			// limit, and that the fragmenter's *FlushTo() and Add() calls are
-			// always made with successively increasing user keys. It's possible
-			// for the last file's Meta.Largest.UserKey
-			// to be substantially less than the last key returned by
-			// the compactionIter, such as in a sequence of consecutive
-			// rangedel tombstones, of which some but not all get elided.
-			// Consider this example:
-			//
-			// Compaction input (all range tombstones in this snippet):
-			// a-b
-			// c-d
-			// e-f  (elided)
-			// g-h  (elided) <-- grandparent limit before this (at ff)
-			// i-j  (elided)
-			// k-q           <-- grandparent limit at k
-			// m-q
-			//
-			// Note that elided tombstones are added to the fragmenter, but
-			// removed before they make their way from the fragmenter onto
-			// iter.tombstones. They still affect the fragmenter's internal
-			// tracking of the key up to which all tombstones have been flushed.
-			// After the first output is cut with limit = g, the fragmenter
-			// is empty, so the next grandparent calculation happens with
-			// key = g, and returns k. We continue adding range tombstones to
-			// the fragmenter between [g,k], which includes k-q as we only
-			// switch outputs after the limit is exceeded. So key = m and
-			// limit = k when finishOutput is called. Since the start key in
-			// the fragmenter (k) matches the limit, and no point keys were
-			// added, we actually don't produce a new output (see the
-			// conditional in finishOutput() on why).
-			//
-			// When we try to calculate the next grandparent limit, since
-			// c.rangeDelFrag.Empty() == false (as k-q is sitting in it),
-			// we fall into this case, and use the end key of the last written
-			// sstable (which was [a-d]) to calculate the grandparent limit.
-			// That gets us g again, which gets us to call
-			// c.rangeDelFrag.FlushTo(g), which violates the
-			// invariant that the current flush-to key (g) be greater than the
-			// last one (k).
-			//
-			// To solve this, if the grandparent limit falls "in between"
-			// ve.NewFiles[n-1].Meta.Largest.UserKey and c.rangeDelFrag.Start(),
-			// re-calculate a higher limit ahead of that key.
-			if c.rangeDelFrag.Start() != nil && c.cmp(limit, c.rangeDelFrag.Start()) <= 0 {
-				limit = c.findGrandparentLimit(c.rangeDelFrag.Start())
-			}
-		}
+		limit := splitter.onNewOutput(key)
 
 		// Each inner loop iteration processes one key from the input iterator.
-		passedGrandparentLimit := false
 		prevPointSeqNum := InternalKeySeqNumMax
 		for ; key != nil; key, val = iter.Next() {
-			// Break out of this loop and switch to a new sstable if we've reached
-			// the grandparent limit. There is a complication here: we can't create
-			// an sstable where the largest key has a seqnum of zero. This limitation
-			// exists because a range tombstone which extends into the next sstable
-			// will cause the smallest key for the next sstable to have the same user
-			// key, but we need the two tables to be disjoint in key space. Consider
-			// the scenario:
-			//
-			//    a#RANGEDEL-c,3 b#SET,0
-			//
-			// If b#SET,0 is the last key added to an sstable, the range tombstone
-			// [b-c)#3 will extend into the next sstable. The boundary generation
-			// code in finishOutput() will compute the smallest key for that sstable
-			// as b#RANGEDEL,3 which sorts before b#SET,0. Normally we just adjust
-			// the seqnum of this key, but that isn't possible for seqnum 0.
-			if passedGrandparentLimit || (limit != nil && c.cmp(key.UserKey, limit) > 0) {
-				// The flush split exception exists because, when flushing
-				// to L0, we are able to guarantee that the end key of
-				// tombstones will also be truncated (through the
-				// TruncateAndFlushTo call), and no user keys will
-				// be split between sstables.
-				if prevPointSeqNum != 0 || c.rangeDelFrag.Empty() || splittingFlush {
-					if passedGrandparentLimit || splittingFlush {
-						limit = key.UserKey
-					}
-					if splittingFlush {
+			if split := splitter.shouldSplitBefore(key, tw); split != noSplit {
+				if split == splitNow {
+					limit = key.UserKey
+					if splitL0Outputs {
 						// Flush all tombstones up until key.UserKey, and
 						// truncate them at that key.
 						//
@@ -1931,13 +2357,16 @@ func (d *DB) runCompaction(
 					}
 					break
 				}
-				// If we can't cut the sstable at limit, we need to ensure that the
-				// limit is at least the last key added to the table. We can't actually
-				// use key.UserKey here because it will be invalidated by the next call
-				// to iter.Next(). Instead, we set a flag indicating that we've passed
-				// the grandparent limit and clear the limit. If we can stop output at
-				// a subsequent key, we'll use that key as the new limit.
-				passedGrandparentLimit = true
+				// split == splitSoon
+				//
+				// Invalidate the limit here. It has probably been exceeded
+				// by the current key, but we can't split just yet, such as to
+				// maintain the nonzero sequence number invariant mentioned
+				// above. Setting limit to nil is okay as it's just a transient
+				// setting, as when split eventually equals splitNow, we will
+				// set the limit to the key after that. If the compaction were
+				// to run out of keys before we get to that point, limit would
+				// be nil as it should be for all end-of-compaction cases.
 				limit = nil
 			}
 
@@ -1952,31 +2381,6 @@ func (d *DB) runCompaction(
 				// keys in the same snapshot stripe can be elided.
 				c.rangeDelFrag.Add(iter.cloneKey(*key), val)
 				continue
-			}
-			if tw != nil && tw.EstimatedSize() >= c.maxOutputFileSize {
-				// Use the next key as the sstable boundary. Note that we already
-				// checked this key against the grandparent limit above.
-				if !splittingFlush {
-					limit = key.UserKey
-					break
-				}
-				// We do not split user keys across different sstables when
-				// splitting flushes. This includes range tombstones; a range
-				// tombstone covering a key in a given flush is guaranteed to
-				// end up in the same sstable as that key. Wide range tombstones
-				// spanning split boundaries are split to keep this invariant
-				// true. This invariant exists because L0 compaction picking and
-				// sublevel construction does not account for atomic compaction
-				// units, unlike regular compactions. Atomic compaction units
-				// resulting from user keys being split across sstables
-				// are an unhelpful side-effects of regular compactions; and the
-				// only reason it's done for regular compactions is to maintain
-				// the same behaviour as RocksDB.
-				//
-				// Set the limit to a copy of the current key, as the current
-				// key is backed by compactionIter. The inner loop will break
-				// and switch outputs when it iterates past this user key.
-				limit = key.Clone().UserKey
 			}
 			if tw == nil {
 				if err := newOutput(); err != nil {
@@ -1994,9 +2398,11 @@ func (d *DB) runCompaction(
 			// We ran out of keys and the last key added to the sstable has a zero
 			// seqnum and there are buffered range tombstones, so we're unable to use
 			// the grandparent/flush limit for the sstable boundary. See the example in the
-			// in the loop above with range tombstones straddling sstables.
+			// in the loop above with range tombstones straddling sstables. Setting
+			// limit to nil ensures that we flush the entirety of the rangedel
+			// fragmenter when writing the last output.
 			limit = nil
-		case key == nil && splittingFlush && !c.rangeDelFrag.Empty():
+		case key == nil && splitL0Outputs && !c.rangeDelFrag.Empty():
 			// We ran out of keys with flush splits enabled, and have remaining
 			// buffered range tombstones. Set limit to nil so all range
 			// tombstones get flushed in the current sstable. Consider this
@@ -2042,7 +2448,7 @@ func (d *DB) runCompaction(
 			ve.DeletedFiles[deletedFileEntry{
 				Level:   cl.level,
 				FileNum: f.FileNum,
-			}] = true
+			}] = f
 		}
 	}
 
@@ -2056,7 +2462,9 @@ func (d *DB) runCompaction(
 // and adds those to the internal lists of obsolete files. Note that the files
 // are not actually deleted by this method. A subsequent call to
 // deleteObsoleteFiles must be performed. Must be not be called concurrently
-// with compactions and flushes.
+// with compactions and flushes. db.mu must be held when calling this function,
+// however as this function is expected to only be called during Open(), no
+// other operations should be contending on it just yet.
 func (d *DB) scanObsoleteFiles(list []string) {
 	if d.mu.compact.compactingCount > 0 || d.mu.compact.flushing {
 		panic("pebble: cannot scan obsolete files concurrently with compaction/flushing")
@@ -2068,7 +2476,7 @@ func (d *DB) scanObsoleteFiles(list []string) {
 	manifestFileNum := d.mu.versions.manifestFileNum
 
 	var obsoleteLogs []FileNum
-	var obsoleteTables []FileNum
+	var obsoleteTables []*fileMetadata
 	var obsoleteManifests []FileNum
 	var obsoleteOptions []FileNum
 
@@ -2097,7 +2505,13 @@ func (d *DB) scanObsoleteFiles(list []string) {
 			if _, ok := liveFileNums[fileNum]; ok {
 				continue
 			}
-			obsoleteTables = append(obsoleteTables, fileNum)
+			fileMeta := &fileMetadata{
+				FileNum: fileNum,
+			}
+			if stat, err := d.opts.FS.Stat(filename); err == nil {
+				fileMeta.Size = uint64(stat.Size())
+			}
+			obsoleteTables = append(obsoleteTables, fileMeta)
 		default:
 			// Don't delete files we don't know about.
 			continue
@@ -2106,7 +2520,8 @@ func (d *DB) scanObsoleteFiles(list []string) {
 
 	d.mu.log.queue = merge(d.mu.log.queue, obsoleteLogs)
 	d.mu.versions.metrics.WAL.Files += int64(len(obsoleteLogs))
-	d.mu.versions.obsoleteTables = merge(d.mu.versions.obsoleteTables, obsoleteTables)
+	d.mu.versions.obsoleteTables = mergeFileMetas(d.mu.versions.obsoleteTables, obsoleteTables)
+	d.mu.versions.incrementObsoleteTablesLocked(obsoleteTables)
 	d.mu.versions.obsoleteManifests = merge(d.mu.versions.obsoleteManifests, obsoleteManifests)
 	d.mu.versions.obsoleteOptions = merge(d.mu.versions.obsoleteOptions, obsoleteOptions)
 }
@@ -2181,6 +2596,14 @@ func (d *DB) deleteObsoleteFiles(jobID int) {
 	d.releaseCleaningTurn()
 }
 
+// obsoleteFile holds information about a file that needs to be deleted soon.
+type obsoleteFile struct {
+	dir      string
+	fileNum  base.FileNum
+	fileType fileType
+	fileSize uint64
+}
+
 // d.mu must be held when calling this, but the mutex may be dropped and
 // re-acquired during the course of this method.
 func (d *DB) doDeleteObsoleteFiles(jobID int) {
@@ -2206,7 +2629,11 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		}
 	}
 
-	obsoleteTables = d.mu.versions.obsoleteTables
+	tableSizeMap := make(map[FileNum]uint64, len(d.mu.versions.obsoleteTables))
+	for _, table := range d.mu.versions.obsoleteTables {
+		tableSizeMap[table.FileNum] = table.Size
+		obsoleteTables = append(obsoleteTables, table.FileNum)
+	}
 	d.mu.versions.obsoleteTables = nil
 
 	obsoleteManifests := d.mu.versions.obsoleteManifests
@@ -2230,6 +2657,7 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		{fileTypeOptions, obsoleteOptions},
 	}
 	_, noRecycle := d.opts.Cleaner.(base.NeedsFileContents)
+	filesToDelete := make([]obsoleteFile, 0, len(files))
 	for _, f := range files {
 		// We sort to make the order of deletions deterministic, which is nice for
 		// tests.
@@ -2238,6 +2666,7 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 		})
 		for _, fileNum := range f.obsolete {
 			dir := d.dirname
+			var fileSize uint64
 			switch f.fileType {
 			case fileTypeLog:
 				if !noRecycle && d.logRecycler.add(fileNum) {
@@ -2246,11 +2675,45 @@ func (d *DB) doDeleteObsoleteFiles(jobID int) {
 				dir = d.walDirname
 			case fileTypeTable:
 				d.tableCache.evict(fileNum)
+				fileSize = tableSizeMap[fileNum]
 			}
 
-			path := base.MakeFilename(d.opts.FS, dir, f.fileType, fileNum)
-			d.deleteObsoleteFile(f.fileType, jobID, path, fileNum)
+			filesToDelete = append(filesToDelete, obsoleteFile{
+				dir:      dir,
+				fileNum:  fileNum,
+				fileType: f.fileType,
+				fileSize: fileSize,
+			})
 		}
+	}
+	if len(filesToDelete) > 0 {
+		// Delete asynchronously if that could get held up in the pacer.
+		if d.opts.Experimental.MinDeletionRate > 0 {
+			go d.paceAndDeleteObsoleteFiles(jobID, filesToDelete)
+		} else {
+			d.paceAndDeleteObsoleteFiles(jobID, filesToDelete)
+		}
+	}
+}
+
+// Paces and eventually deletes the list of obsolete files passed in. db.mu
+// must NOT be held when calling this method.
+func (d *DB) paceAndDeleteObsoleteFiles(jobID int, files []obsoleteFile) {
+	pacer := (pacer)(nilPacer)
+	if d.opts.Experimental.MinDeletionRate > 0 {
+		pacer = newDeletionPacer(d.deletionLimiter, d.getDeletionPacerInfo)
+	}
+
+	for _, of := range files {
+		path := base.MakeFilename(d.opts.FS, of.dir, of.fileType, of.fileNum)
+		if of.fileType == fileTypeTable {
+			_ = pacer.maybeThrottle(of.fileSize)
+			d.mu.Lock()
+			d.mu.versions.metrics.Table.ObsoleteCount--
+			d.mu.versions.metrics.Table.ObsoleteSize -= of.fileSize
+			d.mu.Unlock()
+		}
+		d.deleteObsoleteFile(of.fileType, jobID, path, of.fileNum)
 	}
 }
 
@@ -2283,7 +2746,7 @@ func (d *DB) deleteObsoleteFile(fileType fileType, jobID int, path string, fileN
 	// TODO(peter): need to handle this error, probably by re-adding the
 	// file that couldn't be deleted to one of the obsolete slices map.
 	err := d.opts.Cleaner.Clean(d.opts.FS, fileType, path)
-	if err == os.ErrNotExist {
+	if oserror.IsNotExist(err) {
 		return
 	}
 
@@ -2325,6 +2788,26 @@ func merge(a, b []FileNum) []FileNum {
 	n := 0
 	for i := 0; i < len(a); i++ {
 		if n == 0 || a[i] != a[n-1] {
+			a[n] = a[i]
+			n++
+		}
+	}
+	return a[:n]
+}
+
+func mergeFileMetas(a, b []*fileMetadata) []*fileMetadata {
+	if len(b) == 0 {
+		return a
+	}
+
+	a = append(a, b...)
+	sort.Slice(a, func(i, j int) bool {
+		return a[i].FileNum < a[j].FileNum
+	})
+
+	n := 0
+	for i := 0; i < len(a); i++ {
+		if n == 0 || a[i].FileNum != a[n-1].FileNum {
 			a[n] = a[i]
 			n++
 		}

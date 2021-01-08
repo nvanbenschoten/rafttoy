@@ -2,7 +2,7 @@
 github.com/beorn7/perks/quantile
 # github.com/cespare/xxhash/v2 v2.1.1
 github.com/cespare/xxhash/v2
-# github.com/cockroachdb/errors v1.7.4
+# github.com/cockroachdb/errors v1.8.2
 github.com/cockroachdb/errors
 github.com/cockroachdb/errors/assert
 github.com/cockroachdb/errors/barriers
@@ -14,6 +14,7 @@ github.com/cockroachdb/errors/errutil
 github.com/cockroachdb/errors/hintdetail
 github.com/cockroachdb/errors/issuelink
 github.com/cockroachdb/errors/markers
+github.com/cockroachdb/errors/oserror
 github.com/cockroachdb/errors/report
 github.com/cockroachdb/errors/safedetails
 github.com/cockroachdb/errors/secondary
@@ -22,7 +23,7 @@ github.com/cockroachdb/errors/telemetrykeys
 github.com/cockroachdb/errors/withstack
 # github.com/cockroachdb/logtags v0.0.0-20190617123548-eb05cc24525f
 github.com/cockroachdb/logtags
-# github.com/cockroachdb/pebble v0.0.0-20200831143935-e6a9f9a3c936
+# github.com/cockroachdb/pebble v0.0.0-20210108023705-06cbd4dddcb4
 github.com/cockroachdb/pebble
 github.com/cockroachdb/pebble/internal/arenaskl
 github.com/cockroachdb/pebble/internal/base
@@ -37,13 +38,14 @@ github.com/cockroachdb/pebble/internal/invariants
 github.com/cockroachdb/pebble/internal/manifest
 github.com/cockroachdb/pebble/internal/manual
 github.com/cockroachdb/pebble/internal/private
+github.com/cockroachdb/pebble/internal/randvar
 github.com/cockroachdb/pebble/internal/rangedel
 github.com/cockroachdb/pebble/internal/rate
 github.com/cockroachdb/pebble/internal/rawalloc
 github.com/cockroachdb/pebble/internal/record
 github.com/cockroachdb/pebble/sstable
 github.com/cockroachdb/pebble/vfs
-# github.com/cockroachdb/redact v1.0.5
+# github.com/cockroachdb/redact v1.0.9
 github.com/cockroachdb/redact
 github.com/cockroachdb/redact/internal
 github.com/cockroachdb/redact/internal/fmtsort
@@ -61,7 +63,7 @@ github.com/golang/protobuf/ptypes
 github.com/golang/protobuf/ptypes/any
 github.com/golang/protobuf/ptypes/duration
 github.com/golang/protobuf/ptypes/timestamp
-# github.com/golang/snappy v0.0.2-0.20190904063534-ff6b7dc882cf
+# github.com/golang/snappy v0.0.2
 github.com/golang/snappy
 # github.com/kr/pretty v0.2.1
 github.com/kr/pretty
@@ -113,7 +115,7 @@ go.uber.org/zap/internal/bufferpool
 go.uber.org/zap/internal/color
 go.uber.org/zap/internal/exit
 go.uber.org/zap/zapcore
-# golang.org/x/exp v0.0.0-20200901203048-c4f52b2c50aa
+# golang.org/x/exp v0.0.0-20201229011636-eab1b5eb1a03
 golang.org/x/exp/rand
 # golang.org/x/net v0.0.0-20201006153459-a7d1128ccaa0
 golang.org/x/net/context
@@ -123,9 +125,9 @@ golang.org/x/net/http2/hpack
 golang.org/x/net/idna
 golang.org/x/net/internal/timeseries
 golang.org/x/net/trace
-# golang.org/x/sync v0.0.0-20200625203802-6e8e738ad208
+# golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
 golang.org/x/sync/errgroup
-# golang.org/x/sys v0.0.0-20201009025420-dfb3f7c4e634
+# golang.org/x/sys v0.0.0-20210105210732-16f7687f5001
 golang.org/x/sys/internal/unsafeheader
 golang.org/x/sys/unix
 golang.org/x/sys/windows

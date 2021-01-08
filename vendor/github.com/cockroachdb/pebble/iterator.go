@@ -7,18 +7,32 @@ package pebble
 import (
 	"bytes"
 	"io"
+	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/randvar"
+	"golang.org/x/exp/rand"
 )
 
+// iterPos describes the state of the internal iterator, in terms of whether it is
+// at the position returned to the user (cur), one ahead of the position returned
+// (next for forward iteration and prev for reverse iteration). The cur position
+// is split into two states, for forward and reverse iteration, since we need to
+// differentiate for switching directions.
 type iterPos int8
 
 const (
-	iterPosCur  iterPos = 0
-	iterPosNext iterPos = 1
-	iterPosPrev iterPos = -1
+	iterPosCurForward iterPos = 0
+	iterPosNext       iterPos = 1
+	iterPosPrev       iterPos = -1
+	iterPosCurReverse iterPos = -2
 )
+
+// Approximate gap in bytes between samples of data read during iteration.
+const readBytesPeriod uint64 = 1048576
 
 var errReversePrefixIteration = errors.New("pebble: unsupported reverse prefix iteration")
 
@@ -51,30 +65,50 @@ type IteratorMetrics struct {
 // Next, Prev) return without advancing if the iterator has an accumulated
 // error.
 type Iterator struct {
-	opts        IterOptions
-	cmp         Compare
-	equal       Equal
-	merge       Merge
-	split       Split
-	iter        internalIterator
-	readState   *readState
-	err         error
-	key         []byte
-	keyBuf      []byte
-	value       []byte
-	valueBuf    []byte
-	valueCloser io.Closer
-	valid       bool
-	iterKey     *InternalKey
-	iterValue   []byte
-	pos         iterPos
-	alloc       *iterAlloc
-	prefix      []byte
+	opts         IterOptions
+	cmp          Compare
+	equal        Equal
+	merge        Merge
+	split        Split
+	iter         internalIterator
+	readState    *readState
+	err          error
+	key          []byte
+	keyBuf       []byte
+	value        []byte
+	valueBuf     []byte
+	valueCloser  io.Closer
+	valid        bool
+	iterKey      *InternalKey
+	iterValue    []byte
+	pos          iterPos
+	alloc        *iterAlloc
+	prefix       []byte
+	readSampling readSampling
+
+	// Following fields are only used in Clone.
+	// Non-nil if this Iterator includes a Batch.
+	batch    *Batch
+	newIters tableNewIters
+	seqNum   uint64
+}
+
+// readSampling stores variables used to sample a read to trigger a read
+// compaction
+type readSampling struct {
+	bytesUntilReadSampling uint64
+	rand                   *rand.Rand
+	randvar                *randvar.Uniform
+	pendingCompactions     []readCompaction
+	topFile                *manifest.FileMetadata
+	// forceReadSampling is used for testing purposes to force a read sample on every
+	// call to Iterator.maybeSampleRead()
+	forceReadSampling bool
 }
 
 func (i *Iterator) findNextEntry() bool {
 	i.valid = false
-	i.pos = iterPosCur
+	i.pos = iterPosCurForward
 
 	// Close the closer for the current value if one was open.
 	if i.valueCloser != nil {
@@ -113,7 +147,7 @@ func (i *Iterator) findNextEntry() bool {
 				i.mergeNext(key, valueMerger)
 			}
 			if i.err == nil {
-				i.value, i.valueCloser, i.err = valueMerger.Finish()
+				i.value, i.valueCloser, i.err = valueMerger.Finish(true /* includesBase */)
 			}
 			return i.err == nil
 
@@ -147,9 +181,82 @@ func (i *Iterator) nextUserKey() {
 	}
 }
 
+func (i *Iterator) maybeSampleRead() {
+	if i.readState == nil {
+		return
+	}
+	if i.readSampling.forceReadSampling {
+		i.sampleRead()
+		return
+	}
+	samplingPeriod := readBytesPeriod * i.readState.db.opts.Experimental.ReadSamplingMultiplier
+	if samplingPeriod <= 0 {
+		return
+	}
+	if i.readSampling.rand == nil || i.readSampling.randvar == nil {
+		i.readSampling.rand = rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+		i.readSampling.randvar = randvar.NewUniform(0, 2*samplingPeriod)
+	}
+	bytesRead := uint64(len(i.key) + len(i.value))
+	for i.readSampling.bytesUntilReadSampling < bytesRead {
+		i.readSampling.bytesUntilReadSampling += i.readSampling.randvar.Uint64(i.readSampling.rand)
+		i.sampleRead()
+	}
+	i.readSampling.bytesUntilReadSampling -= bytesRead
+}
+
+func (i *Iterator) sampleRead() {
+	topFile := i.readSampling.topFile
+	topLevel, numOverlappingLevels := numLevels, 0
+	if mi, ok := i.iter.(*mergingIter); ok {
+		if len(mi.levels) > 1 {
+			mi.ForEachLevelIter(func(li *levelIter) bool {
+				l := manifest.LevelToInt(li.level)
+				// TODO(aaditya): Fix edge case: For Iterator.Last(), Iterator.SeekLT() and Iterator.Prev(),
+				// if the key is the first key of the file or the only key, sampling skips it because
+				// the iterator has already moved past it. The solution would be to check for this, and then
+				// seek to the correct file to sample it. This could have a performance impact which needs to
+				// be tested in benchmarks.
+				if file := li.files.Current(); file != nil {
+					var containsKey bool
+					if i.pos == iterPosNext || i.pos == iterPosCurForward {
+						containsKey = i.cmp(file.Smallest.UserKey, i.key) <= 0
+					} else if i.pos == iterPosPrev || i.pos == iterPosCurReverse {
+						containsKey = i.cmp(file.Largest.UserKey, i.key) >= 0
+					}
+					if containsKey {
+						numOverlappingLevels++
+						if numOverlappingLevels >= 2 {
+							// Terminate the loop early if at least 2 overlapping levels are found.
+							return true
+						}
+						topLevel = l
+						topFile = file
+					}
+				}
+				return false
+			})
+		}
+	}
+	if topFile == nil || topLevel >= numLevels {
+		return
+	}
+	if numOverlappingLevels >= 2 {
+		allowedSeeks := atomic.AddInt64(&topFile.Atomic.AllowedSeeks, -1)
+		if allowedSeeks == 0 {
+			read := readCompaction{
+				start: topFile.Smallest.UserKey,
+				end:   topFile.Largest.UserKey,
+				level: topLevel,
+			}
+			i.readSampling.pendingCompactions = append(i.readSampling.pendingCompactions, read)
+		}
+	}
+}
+
 func (i *Iterator) findPrevEntry() bool {
 	i.valid = false
-	i.pos = iterPosCur
+	i.pos = iterPosCurReverse
 
 	// Close the closer for the current value if one was open.
 	if i.valueCloser != nil {
@@ -169,7 +276,7 @@ func (i *Iterator) findPrevEntry() bool {
 				// We've iterated to the previous user key.
 				i.pos = iterPosPrev
 				if valueMerger != nil {
-					i.value, i.valueCloser, i.err = valueMerger.Finish()
+					i.value, i.valueCloser, i.err = valueMerger.Finish(true /* includesBase */)
 				}
 				return i.err == nil
 			}
@@ -229,10 +336,11 @@ func (i *Iterator) findPrevEntry() bool {
 		}
 	}
 
+	// i.iterKey == nil, so broke out of the preceding loop.
 	if i.valid {
 		i.pos = iterPosPrev
 		if valueMerger != nil {
-			i.value, i.valueCloser, i.err = valueMerger.Finish()
+			i.value, i.valueCloser, i.err = valueMerger.Finish(true /* includesBase */)
 		}
 		return i.err == nil
 	}
@@ -320,7 +428,9 @@ func (i *Iterator) SeekGE(key []byte) bool {
 	}
 
 	i.iterKey, i.iterValue = i.iter.SeekGE(key)
-	return i.findNextEntry()
+	valid := i.findNextEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // SeekPrefixGE moves the iterator to the first key/value pair whose key is
@@ -353,6 +463,19 @@ func (i *Iterator) SeekGE(key []byte) bool {
 //   SeekPrefixGE("a@0") -> "a@1"
 //   Next()              -> "a@2"
 //   Next()              -> EOF
+//
+// If you're just looking to iterate over keys with a shared prefix, as
+// defined by the configured comparer, set iterator bounds instead:
+//
+//  iter := db.NewIter(&pebble.IterOptions{
+//    LowerBound: []byte("prefix"),
+//    UpperBound: []byte("prefiy"),
+//  })
+//  for iter.First(); iter.Valid(); iter.Next() {
+//    // Only keys beginning with "prefix" will be visited.
+//  }
+//
+// See Example_prefixiteration for a working example.
 func (i *Iterator) SeekPrefixGE(key []byte) bool {
 	i.err = nil // clear cached iteration error
 
@@ -381,7 +504,9 @@ func (i *Iterator) SeekPrefixGE(key []byte) bool {
 	}
 
 	i.iterKey, i.iterValue = i.iter.SeekPrefixGE(i.prefix, key)
-	return i.findNextEntry()
+	valid := i.findNextEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // SeekLT moves the iterator to the last key/value pair whose key is less than
@@ -397,7 +522,9 @@ func (i *Iterator) SeekLT(key []byte) bool {
 	}
 
 	i.iterKey, i.iterValue = i.iter.SeekLT(key)
-	return i.findPrevEntry()
+	valid := i.findPrevEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // First moves the iterator the the first key/value pair. Returns true if the
@@ -410,7 +537,9 @@ func (i *Iterator) First() bool {
 	} else {
 		i.iterKey, i.iterValue = i.iter.First()
 	}
-	return i.findNextEntry()
+	valid := i.findNextEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // Last moves the iterator the the last key/value pair. Returns true if the
@@ -423,7 +552,9 @@ func (i *Iterator) Last() bool {
 	} else {
 		i.iterKey, i.iterValue = i.iter.Last()
 	}
-	return i.findPrevEntry()
+	valid := i.findPrevEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // Next moves the iterator to the next key/value pair. Returns true if the
@@ -433,8 +564,24 @@ func (i *Iterator) Next() bool {
 		return false
 	}
 	switch i.pos {
-	case iterPosCur:
+	case iterPosCurForward:
 		i.nextUserKey()
+	case iterPosCurReverse:
+		// Switching directions.
+		// Unless the iterator was exhausted, reverse iteration needs to
+		// position the iterator at iterPosPrev.
+		if i.iterKey != nil {
+			i.err = errors.New("switching from reverse to forward but iter is not at prev")
+			i.valid = false
+			return false
+		}
+		// We're positioned before the first key. Need to reposition to point to
+		// the first key.
+		if lowerBound := i.opts.GetLowerBound(); lowerBound != nil {
+			i.iterKey, i.iterValue = i.iter.SeekGE(lowerBound)
+		} else {
+			i.iterKey, i.iterValue = i.iter.First()
+		}
 	case iterPosPrev:
 		// The underlying iterator is pointed to the previous key (this can only
 		// happen when switching iteration directions). We set i.valid to false
@@ -455,7 +602,9 @@ func (i *Iterator) Next() bool {
 		i.nextUserKey()
 	case iterPosNext:
 	}
-	return i.findNextEntry()
+	valid := i.findNextEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // Prev moves the iterator to the previous key/value pair. Returns true if the
@@ -469,13 +618,21 @@ func (i *Iterator) Prev() bool {
 		return false
 	}
 	switch i.pos {
-	case iterPosCur:
+	case iterPosCurForward:
+		// Switching directions, and will handle this below.
+	case iterPosCurReverse:
 		i.prevUserKey()
 	case iterPosNext:
 		// The underlying iterator is pointed to the next key (this can only happen
-		// when switching iteration directions). We set i.valid to false here to
-		// force the calls to prevUserKey to save the current key i.iter is
-		// pointing at in order to determine when the prev user-key is reached.
+		// when switching iteration directions). We will handle this below.
+	case iterPosPrev:
+	}
+	if i.pos == iterPosCurForward || i.pos == iterPosNext {
+		stepAgain := i.pos == iterPosNext
+		// Switching direction.
+		// We set i.valid to false here to force the calls to prevUserKey to
+		// save the current key i.iter is pointing at in order to determine
+		// when the prev user-key is reached.
 		i.valid = false
 		if i.iterKey == nil {
 			// We're positioned after the last key. Need to reposition to point to
@@ -488,10 +645,13 @@ func (i *Iterator) Prev() bool {
 		} else {
 			i.prevUserKey()
 		}
-		i.prevUserKey()
-	case iterPosPrev:
+		if stepAgain {
+			i.prevUserKey()
+		}
 	}
-	return i.findPrevEntry()
+	valid := i.findPrevEntry()
+	i.maybeSampleRead()
+	return valid
 }
 
 // Key returns the key of the current key/value pair, or nil if done. The
@@ -538,6 +698,13 @@ func (i *Iterator) Close() error {
 	err := i.err
 
 	if i.readState != nil {
+		if len(i.readSampling.pendingCompactions) > 0 {
+			// Copy pending read compactions using db.mu.Lock()
+			i.readState.db.mu.Lock()
+			i.readState.db.mu.compact.readCompactions = append(i.readState.db.mu.compact.readCompactions, i.readSampling.pendingCompactions...)
+			i.readState.db.mu.Unlock()
+		}
+
 		i.readState.unref()
 		i.readState = nil
 	}
@@ -570,7 +737,16 @@ func (i *Iterator) SetBounds(lower, upper []byte) {
 	i.prefix = nil
 	i.iterKey = nil
 	i.iterValue = nil
-	i.pos = iterPosCur
+	// This switch statement isn't necessary for correctness since callers
+	// should call a repositioning method. We could have arbitrarily set i.pos
+	// to one of the values. But it results in more intuitive behavior in
+	// tests, which do not always reposition.
+	switch i.pos {
+	case iterPosCurForward, iterPosNext:
+		i.pos = iterPosCurForward
+	case iterPosCurReverse, iterPosPrev:
+		i.pos = iterPosCurReverse
+	}
 	i.valid = false
 
 	i.opts.LowerBound = lower
@@ -587,4 +763,50 @@ func (i *Iterator) Metrics() IteratorMetrics {
 		m.ReadAmp = len(mi.levels)
 	}
 	return m
+}
+
+// Clone creates a new Iterator over the same underlying data, i.e., over the
+// same {batch, memtables, sstables}). It starts with the same IterOptions but
+// is not positioned. Note that IterOptions is not deep-copied, so the
+// LowerBound and UpperBound slices will share memory with the original
+// Iterator. Iterators assume that these bound slices are not mutated by the
+// callers, for the lifetime of use by an Iterator. The lifetime of use spans
+// from the Iterator creation/SetBounds call to the next SetBounds call. If
+// the caller is tracking this lifetime in order to reuse memory of these
+// slices, it must remember that now the lifetime of use is due to multiple
+// Iterators. The simplest behavior the caller can adopt to decouple lifetimes
+// is to call SetBounds on the new Iterator, immediately after Clone returns,
+// with different bounds slices.
+//
+// Callers can use Clone if they need multiple iterators that need to see
+// exactly the same underlying state of the DB. This should not be used to
+// extend the lifetime of the data backing the original Iterator since that
+// will cause an increase in memory and disk usage (use NewSnapshot for that
+// purpose).
+func (i *Iterator) Clone() (*Iterator, error) {
+	readState := i.readState
+	if readState == nil {
+		return nil, errors.Errorf("cannot Clone a closed Iterator")
+	}
+	// i is already holding a ref, so there is no race with unref here.
+	readState.ref()
+	// Bundle various structures under a single umbrella in order to allocate
+	// them together.
+	buf := iterAllocPool.Get().(*iterAlloc)
+	dbi := &buf.dbi
+	*dbi = Iterator{
+		opts:      i.opts,
+		alloc:     buf,
+		cmp:       i.cmp,
+		equal:     i.equal,
+		iter:      &buf.merging,
+		merge:     i.merge,
+		split:     i.split,
+		readState: readState,
+		keyBuf:    buf.keyBuf,
+		batch:     i.batch,
+		newIters:  i.newIters,
+		seqNum:    i.seqNum,
+	}
+	return finishInitializingIter(buf), nil
 }
