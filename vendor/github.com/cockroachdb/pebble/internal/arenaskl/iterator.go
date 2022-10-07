@@ -78,7 +78,30 @@ func (it *Iterator) Error() error {
 // pointing at a valid entry, and (nil, nil) otherwise. Note that SeekGE only
 // checks the upper bound. It is up to the caller to ensure that key is greater
 // than or equal to the lower bound.
-func (it *Iterator) SeekGE(key []byte) (*base.InternalKey, []byte) {
+func (it *Iterator) SeekGE(key []byte, flags base.SeekGEFlags) (*base.InternalKey, []byte) {
+	if flags.TrySeekUsingNext() {
+		if it.nd == it.list.tail {
+			// Iterator is done.
+			return nil, nil
+		}
+		less := it.list.cmp(it.key.UserKey, key) < 0
+		// Arbitrary constant. By measuring the seek cost as a function of the
+		// number of elements in the skip list, and fitting to a model, we
+		// could adjust the number of nexts based on the current size of the
+		// skip list.
+		const numNexts = 5
+		for i := 0; less && i < numNexts; i++ {
+			k, _ := it.Next()
+			if k == nil {
+				// Iterator is done.
+				return nil, nil
+			}
+			less = it.list.cmp(it.key.UserKey, key) < 0
+		}
+		if !less {
+			return &it.key, it.value()
+		}
+	}
 	_, it.nd, _ = it.seekForBaseSplice(key)
 	if it.nd == it.list.tail {
 		return nil, nil
@@ -95,15 +118,17 @@ func (it *Iterator) SeekGE(key []byte) (*base.InternalKey, []byte) {
 // or equal to the given key. This method is equivalent to SeekGE and is
 // provided so that an arenaskl.Iterator implements the
 // internal/base.InternalIterator interface.
-func (it *Iterator) SeekPrefixGE(prefix, key []byte) (*base.InternalKey, []byte) {
-	return it.SeekGE(key)
+func (it *Iterator) SeekPrefixGE(
+	prefix, key []byte, flags base.SeekGEFlags,
+) (*base.InternalKey, []byte) {
+	return it.SeekGE(key, flags)
 }
 
 // SeekLT moves the iterator to the last entry whose key is less than the given
 // key. Returns the key and value if the iterator is pointing at a valid entry,
 // and (nil, nil) otherwise. Note that SeekLT only checks the lower bound. It
 // is up to the caller to ensure that key is less than the upper bound.
-func (it *Iterator) SeekLT(key []byte) (*base.InternalKey, []byte) {
+func (it *Iterator) SeekLT(key []byte, flags base.SeekLTFlags) (*base.InternalKey, []byte) {
 	// NB: the top-level Iterator has already adjusted key based on
 	// the upper-bound.
 	it.nd, _, _ = it.seekForBaseSplice(key)

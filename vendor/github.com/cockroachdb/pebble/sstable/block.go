@@ -10,6 +10,10 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
+	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/rangekey"
 )
 
 func uvarintLen(v uint32) int {
@@ -33,16 +37,35 @@ type blockWriter struct {
 	tmp             [4]byte
 }
 
+func (w *blockWriter) clear() {
+	*w = blockWriter{
+		buf:      w.buf[:0],
+		restarts: w.restarts[:0],
+		curKey:   w.curKey[:0],
+		curValue: w.curValue[:0],
+		prevKey:  w.prevKey[:0],
+	}
+}
+
 func (w *blockWriter) store(keySize int, value []byte) {
 	shared := 0
 	if w.nEntries == w.nextRestart {
 		w.nextRestart = w.nEntries + w.restartInterval
 		w.restarts = append(w.restarts, uint32(len(w.buf)))
 	} else {
-		// TODO(peter): Manually inlined version of base.SharedPrefixLen()
+		// TODO(peter): Manually inlined version of base.SharedPrefixLen(). This
+		// is 3% faster on BenchmarkWriter on go1.16. Remove if future versions
+		// show this to not be a performance win. For now, functions that use of
+		// unsafe cannot be inlined.
 		n := len(w.curKey)
 		if n > len(w.prevKey) {
 			n = len(w.prevKey)
+		}
+		asUint64 := func(b []byte, i int) uint64 {
+			return binary.LittleEndian.Uint64(b[i:])
+		}
+		for shared < n-7 && asUint64(w.curKey, shared) == asUint64(w.prevKey, shared) {
+			shared += 8
 		}
 		for shared < n && w.curKey[shared] == w.prevKey[shared] {
 			shared++
@@ -151,8 +174,13 @@ func (w *blockWriter) finish() []byte {
 	return result
 }
 
+// emptyBlockSize holds the size of an empty block. Every block ends
+// in a uint32 trailer encoding the number of restart points within the
+// block.
+const emptyBlockSize = 4
+
 func (w *blockWriter) estimatedSize() int {
-	return len(w.buf) + 4*(len(w.restarts)+1)
+	return len(w.buf) + 4*len(w.restarts) + emptyBlockSize
 }
 
 type blockEntry struct {
@@ -174,10 +202,15 @@ type blockEntry struct {
 // interval of 1 (no prefix compression), blockIter guarantees that
 // InternalKey.UserKey will point to the key as stored in the block itself
 // which will remain valid until the blockIter is closed. The key stability
-// guarantee is used by the range tombstone code which knows that range
-// tombstones are always encoded with a restart interval of 1. This per-block
-// key stability guarantee is sufficient for range tombstones as they are
-// always encoded in a single block.
+// guarantee is used by the range tombstone and range key code, which knows that
+// the respective blocks are always encoded with a restart interval of 1. This
+// per-block key stability guarantee is sufficient for range tombstones and
+// range deletes as they are always encoded in a single block.
+//
+// A blockIter also provides a value stability guarantee for range deletions and
+// range keys since there is only a single range deletion and range key block
+// per sstable and the blockIter will not release the bytes for the block until
+// it is closed.
 type blockIter struct {
 	cmp Compare
 	// offset is the byte index that marks where the current key/value is
@@ -501,7 +534,7 @@ func (i *blockIter) cacheEntry() {
 
 // SeekGE implements internalIterator.SeekGE, as documented in the pebble
 // package.
-func (i *blockIter) SeekGE(key []byte) (*InternalKey, []byte) {
+func (i *blockIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, []byte) {
 	i.clearCache()
 
 	ikey := base.MakeSearchKey(key)
@@ -594,7 +627,7 @@ func (i *blockIter) SeekGE(key []byte) (*InternalKey, []byte) {
 	i.decodeInternalKey(i.key)
 
 	// Iterate from that restart point to somewhere >= the key sought.
-	for ; i.Valid(); i.Next() {
+	for ; i.valid(); i.Next() {
 		if base.InternalCompare(i.cmp, i.ikey, ikey) >= 0 {
 			return &i.ikey, i.val
 		}
@@ -605,14 +638,16 @@ func (i *blockIter) SeekGE(key []byte) (*InternalKey, []byte) {
 
 // SeekPrefixGE implements internalIterator.SeekPrefixGE, as documented in the
 // pebble package.
-func (i *blockIter) SeekPrefixGE(prefix, key []byte) (*InternalKey, []byte) {
+func (i *blockIter) SeekPrefixGE(
+	prefix, key []byte, flags base.SeekGEFlags,
+) (*base.InternalKey, []byte) {
 	// This should never be called as prefix iteration is handled by sstable.Iterator.
 	panic("pebble: SeekPrefixGE unimplemented")
 }
 
 // SeekLT implements internalIterator.SeekLT, as documented in the pebble
 // package.
-func (i *blockIter) SeekLT(key []byte) (*InternalKey, []byte) {
+func (i *blockIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, []byte) {
 	i.clearCache()
 
 	ikey := base.MakeSearchKey(key)
@@ -741,7 +776,7 @@ func (i *blockIter) SeekLT(key []byte) (*InternalKey, []byte) {
 		i.cacheEntry()
 	}
 
-	if !i.Valid() {
+	if !i.valid() {
 		return nil, nil
 	}
 	return &i.ikey, i.val
@@ -751,7 +786,7 @@ func (i *blockIter) SeekLT(key []byte) (*InternalKey, []byte) {
 // package.
 func (i *blockIter) First() (*InternalKey, []byte) {
 	i.offset = 0
-	if !i.Valid() {
+	if !i.valid() {
 		return nil, nil
 	}
 	i.clearCache()
@@ -764,7 +799,7 @@ func (i *blockIter) First() (*InternalKey, []byte) {
 func (i *blockIter) Last() (*InternalKey, []byte) {
 	// Seek forward from the last restart point.
 	i.offset = int32(binary.LittleEndian.Uint32(i.data[i.restarts+4*(i.numRestarts-1):]))
-	if !i.Valid() {
+	if !i.valid() {
 		return nil, nil
 	}
 
@@ -800,7 +835,7 @@ func (i *blockIter) Next() (*InternalKey, []byte) {
 	}
 
 	i.offset = i.nextOffset
-	if !i.Valid() {
+	if !i.valid() {
 		return nil, nil
 	}
 	i.readEntry()
@@ -900,12 +935,6 @@ func (i *blockIter) Value() []byte {
 	return i.val
 }
 
-// Valid implements internalIterator.Valid, as documented in the pebble
-// package.
-func (i *blockIter) Valid() bool {
-	return i.offset >= 0 && i.offset < i.restarts
-}
-
 // Error implements internalIterator.Error, as documented in the pebble
 // package.
 func (i *blockIter) Error() error {
@@ -924,4 +953,282 @@ func (i *blockIter) Close() error {
 func (i *blockIter) SetBounds(lower, upper []byte) {
 	// This should never be called as bounds are handled by sstable.Iterator.
 	panic("pebble: SetBounds unimplemented")
+}
+
+func (i *blockIter) valid() bool {
+	return i.offset >= 0 && i.offset < i.restarts
+}
+
+// fragmentBlockIter wraps a blockIter, implementing the
+// keyspan.FragmentIterator interface. It's used for reading range deletion and
+// range key blocks.
+//
+// Range deletions and range keys are fragmented before they're persisted to the
+// block. Overlapping fragments have identical bounds.  The fragmentBlockIter
+// gathers all the fragments with identical bounds within a block and returns a
+// single keyspan.Span describing all the keys defined over the span.
+//
+// Memory lifetime
+//
+// A Span returned by fragmentBlockIter is only guaranteed to be stable until
+// the next fragmentBlockIter iteration positioning method. A Span's Keys slice
+// may be reused, so the user must not assume it's stable.
+//
+// Blocks holding range deletions and range keys are configured to use a restart
+// interval of 1. This provides key stability. The caller may treat the various
+// byte slices (start, end, suffix, value) as stable for the lifetime of the
+// iterator.
+type fragmentBlockIter struct {
+	blockIter blockIter
+	keyBuf    [2]keyspan.Key
+	span      keyspan.Span
+	err       error
+	dir       int8
+	closeHook func(i keyspan.FragmentIterator) error
+}
+
+func (i *fragmentBlockIter) resetForReuse() fragmentBlockIter {
+	return fragmentBlockIter{blockIter: i.blockIter.resetForReuse()}
+}
+
+func (i *fragmentBlockIter) decodeSpanKeys(k *InternalKey, internalValue []byte) {
+	// TODO(jackson): The use of i.span.Keys to accumulate keys across multiple
+	// calls to Decode is too confusing and subtle. Refactor to make it
+	// explicit.
+
+	// decode the contents of the fragment's value. This always includes at
+	// least the end key: RANGEDELs store the end key directly as the value,
+	// whereas the various range key kinds store are more complicated.  The
+	// details of the range key internal value format are documented within the
+	// internal/rangekey package.
+	switch k.Kind() {
+	case base.InternalKeyKindRangeDelete:
+		i.span = rangedel.Decode(*k, internalValue, i.span.Keys)
+		i.err = nil
+	case base.InternalKeyKindRangeKeySet, base.InternalKeyKindRangeKeyUnset, base.InternalKeyKindRangeKeyDelete:
+		i.span, i.err = rangekey.Decode(*k, internalValue, i.span.Keys)
+	default:
+		i.span = keyspan.Span{}
+		i.err = base.CorruptionErrorf("pebble: corrupt keyspan fragment of kind %d", k.Kind())
+	}
+}
+
+// gatherForward gathers internal keys with identical bounds. Keys defined over
+// spans of the keyspace are fragmented such that any overlapping key spans have
+// identical bounds. When these spans are persisted to a range deletion or range
+// key block, they may be persisted as multiple internal keys in order to encode
+// multiple sequence numbers or key kinds.
+//
+// gatherForward iterates forward, re-combining the fragmented internal keys to
+// reconstruct a keyspan.Span that holds all the keys defined over the span.
+func (i *fragmentBlockIter) gatherForward(k *InternalKey, internalValue []byte) *keyspan.Span {
+	i.span = keyspan.Span{}
+	if k == nil || !i.blockIter.valid() {
+		return nil
+	}
+	i.err = nil
+	// Use the i.keyBuf array to back the Keys slice to prevent an allocation
+	// when a span contains few keys.
+	i.span.Keys = i.keyBuf[:0]
+
+	// Decode the span's end key and individual keys from the value.
+	i.decodeSpanKeys(k, internalValue)
+	if i.err != nil {
+		return nil
+	}
+	prevEnd := i.span.End
+
+	// There might exist additional internal keys with identical bounds encoded
+	// within the block. Iterate forward, accumulating all the keys with
+	// identical bounds to s.
+	k, internalValue = i.blockIter.Next()
+	for k != nil && i.blockIter.cmp(k.UserKey, i.span.Start) == 0 {
+		i.decodeSpanKeys(k, internalValue)
+		if i.err != nil {
+			return nil
+		}
+
+		// Since k indicates an equal start key, the encoded end key must
+		// exactly equal the original end key from the first internal key.
+		// Overlapping fragments are required to have exactly equal start and
+		// end bounds.
+		if i.blockIter.cmp(prevEnd, i.span.End) != 0 {
+			i.err = base.CorruptionErrorf("pebble: corrupt keyspan fragmentation")
+			i.span = keyspan.Span{}
+			return nil
+		}
+		k, internalValue = i.blockIter.Next()
+	}
+	// i.blockIter is positioned over the first internal key for the next span.
+	return &i.span
+}
+
+// gatherBackward gathers internal keys with identical bounds. Keys defined over
+// spans of the keyspace are fragmented such that any overlapping key spans have
+// identical bounds. When these spans are persisted to a range deletion or range
+// key block, they may be persisted as multiple internal keys in order to encode
+// multiple sequence numbers or key kinds.
+//
+// gatherBackward iterates backwards, re-combining the fragmented internal keys
+// to reconstruct a keyspan.Span that holds all the keys defined over the span.
+func (i *fragmentBlockIter) gatherBackward(k *InternalKey, internalValue []byte) *keyspan.Span {
+	i.span = keyspan.Span{}
+	if k == nil || !i.blockIter.valid() {
+		return nil
+	}
+	i.err = nil
+	// Use the i.keyBuf array to back the Keys slice to prevent an allocation
+	// when a span contains few keys.
+	i.span.Keys = i.keyBuf[:0]
+
+	// Decode the span's end key and individual keys from the value.
+	i.decodeSpanKeys(k, internalValue)
+	if i.err != nil {
+		return nil
+	}
+	prevEnd := i.span.End
+
+	// There might exist additional internal keys with identical bounds encoded
+	// within the block. Iterate backward, accumulating all the keys with
+	// identical bounds to s.
+	k, internalValue = i.blockIter.Prev()
+	for k != nil && i.blockIter.cmp(k.UserKey, i.span.Start) == 0 {
+		i.decodeSpanKeys(k, internalValue)
+		if i.err != nil {
+			return nil
+		}
+
+		// Since k indicates an equal start key, the encoded end key must
+		// exactly equal the original end key from the first internal key.
+		// Overlapping fragments are required to have exactly equal start and
+		// end bounds.
+		if i.blockIter.cmp(prevEnd, i.span.End) != 0 {
+			i.err = base.CorruptionErrorf("pebble: corrupt keyspan fragmentation")
+			i.span = keyspan.Span{}
+			return nil
+		}
+		k, internalValue = i.blockIter.Prev()
+	}
+	// i.blockIter is positioned over the last internal key for the previous
+	// span.
+
+	// Backwards iteration encounters internal keys in the wrong order.
+	keyspan.SortKeysByTrailer(&i.span.Keys)
+
+	return &i.span
+}
+
+// Error implements (keyspan.FragmentIterator).Error.
+func (i *fragmentBlockIter) Error() error {
+	return i.err
+}
+
+// Close implements (keyspan.FragmentIterator).Close.
+func (i *fragmentBlockIter) Close() error {
+	var err error
+	if i.closeHook != nil {
+		err = i.closeHook(i)
+	}
+	err = firstError(err, i.blockIter.Close())
+	return err
+}
+
+// First implements (keyspan.FragmentIterator).First
+func (i *fragmentBlockIter) First() *keyspan.Span {
+	i.dir = +1
+	return i.gatherForward(i.blockIter.First())
+}
+
+// Last implements (keyspan.FragmentIterator).Last.
+func (i *fragmentBlockIter) Last() *keyspan.Span {
+	i.dir = -1
+	return i.gatherBackward(i.blockIter.Last())
+}
+
+// Next implements (keyspan.FragmentIterator).Next.
+func (i *fragmentBlockIter) Next() *keyspan.Span {
+	switch {
+	case i.dir == -1 && !i.span.Valid():
+		// Switching directions.
+		//
+		// i.blockIter is exhausted, before the first key. Move onto the first.
+		i.blockIter.First()
+		i.dir = +1
+	case i.dir == -1 && i.span.Valid():
+		// Switching directions.
+		//
+		// i.blockIter is currently positioned over the last internal key for
+		// the previous span. Next it once to move to the first internal key
+		// that makes up the current span, and gatherForwaad to land on the
+		// first internal key making up the next span.
+		//
+		// In the diagram below, if the last span returned to the user during
+		// reverse iteration was [b,c), i.blockIter is currently positioned at
+		// [a,b). The block iter must be positioned over [d,e) to gather the
+		// next span's fragments.
+		//
+		//    ... [a,b) [b,c) [b,c) [b,c) [d,e) ...
+		//          ^                       ^
+		//     i.blockIter                 want
+		if x := i.gatherForward(i.blockIter.Next()); invariants.Enabled && !x.Valid() {
+			panic("pebble: invariant violation: next entry unexpectedly invalid")
+		}
+		i.dir = +1
+	}
+	return i.gatherForward(&i.blockIter.ikey, i.blockIter.val)
+}
+
+// Prev implements (keyspan.FragmentIterator).Prev.
+func (i *fragmentBlockIter) Prev() *keyspan.Span {
+	switch {
+	case i.dir == +1 && !i.span.Valid():
+		// Switching directions.
+		//
+		// i.blockIter is exhausted, after the last key. Move onto the last.
+		i.blockIter.Last()
+		i.dir = -1
+	case i.dir == +1 && i.span.Valid():
+		// Switching directions.
+		//
+		// i.blockIter is currently positioned over the first internal key for
+		// the next span. Prev it once to move to the last internal key that
+		// makes up the current span, and gatherBackward to land on the last
+		// internal key making up the previous span.
+		//
+		// In the diagram below, if the last span returned to the user during
+		// forward iteration was [b,c), i.blockIter is currently positioned at
+		// [d,e). The block iter must be positioned over [a,b) to gather the
+		// previous span's fragments.
+		//
+		//    ... [a,b) [b,c) [b,c) [b,c) [d,e) ...
+		//          ^                       ^
+		//        want                  i.blockIter
+		if x := i.gatherBackward(i.blockIter.Prev()); invariants.Enabled && !x.Valid() {
+			panic("pebble: invariant violation: previous entry unexpectedly invalid")
+		}
+		i.dir = -1
+	}
+	return i.gatherBackward(&i.blockIter.ikey, i.blockIter.val)
+}
+
+// SeekGE implements (keyspan.FragmentIterator).SeekGE.
+func (i *fragmentBlockIter) SeekGE(k []byte) *keyspan.Span {
+	i.dir = +1
+	return i.gatherForward(i.blockIter.SeekGE(k, base.SeekGEFlags(0)))
+}
+
+// SeekLT implements (keyspan.FragmentIterator).SeekLT.
+func (i *fragmentBlockIter) SeekLT(k []byte) *keyspan.Span {
+	i.dir = -1
+	return i.gatherBackward(i.blockIter.SeekLT(k, base.SeekLTFlagsNone))
+}
+
+// String implements fmt.Stringer.
+func (i *fragmentBlockIter) String() string {
+	return "fragment-block-iter"
+}
+
+// SetCloseHook implements sstable.FragmentIterator.
+func (i *fragmentBlockIter) SetCloseHook(fn func(i keyspan.FragmentIterator) error) {
+	i.closeHook = fn
 }

@@ -31,6 +31,13 @@ type BlockHandle struct {
 	Offset, Length uint64
 }
 
+// BlockHandleWithProperties is used for data blocks and first/lower level
+// index blocks, since they can be annotated using BlockPropertyCollectors.
+type BlockHandleWithProperties struct {
+	BlockHandle
+	Props []byte
+}
+
 type filterWriter interface {
 	addKey(key []byte)
 	finish() ([]byte, error)

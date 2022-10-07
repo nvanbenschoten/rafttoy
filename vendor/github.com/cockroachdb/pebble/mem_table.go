@@ -15,11 +15,13 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/rangekey"
 )
 
 func memTableEntrySize(keyBytes, valueBytes int) uint64 {
-	return uint64(arenaskl.MaxNodeSize(uint32(keyBytes)+8, uint32(valueBytes)))
+	return arenaskl.MaxNodeSize(uint32(keyBytes)+8, uint32(valueBytes))
 }
 
 // memTableEmptySize is the amount of allocated space in the arena when the
@@ -27,9 +29,11 @@ func memTableEntrySize(keyBytes, valueBytes int) uint64 {
 var memTableEmptySize = func() uint32 {
 	var pointSkl arenaskl.Skiplist
 	var rangeDelSkl arenaskl.Skiplist
+	var rangeKeySkl arenaskl.Skiplist
 	arena := arenaskl.NewArena(make([]byte, 16<<10 /* 16 KB */))
 	pointSkl.Reset(arena, bytes.Compare)
 	rangeDelSkl.Reset(arena, bytes.Compare)
+	rangeKeySkl.Reset(arena, bytes.Compare)
 	return arena.Size()
 }()
 
@@ -65,6 +69,7 @@ type memTable struct {
 	arenaBuf    []byte
 	skl         arenaskl.Skiplist
 	rangeDelSkl arenaskl.Skiplist
+	rangeKeySkl arenaskl.Skiplist
 	// reserved tracks the amount of space used by the memtable, both by actual
 	// data stored in the memtable as well as inflight batch commit
 	// operations. This value is incremented pessimistically by prepare() in
@@ -76,7 +81,8 @@ type memTable struct {
 	// applied. The memtable cannot be flushed to disk until the writer refs
 	// drops to zero.
 	writerRefs int32
-	tombstones rangeTombstoneCache
+	tombstones keySpanCache
+	rangeKeys  keySpanCache
 	// The current logSeqNum at the time the memtable was created. This is
 	// guaranteed to be less than or equal to any seqnum stored in the memtable.
 	logSeqNum uint64
@@ -116,6 +122,18 @@ func newMemTable(opts memTableOptions) *memTable {
 		writerRefs: 1,
 		logSeqNum:  opts.logSeqNum,
 	}
+	m.tombstones = keySpanCache{
+		cmp:           m.cmp,
+		formatKey:     m.formatKey,
+		skl:           &m.rangeDelSkl,
+		constructSpan: rangeDelConstructSpan,
+	}
+	m.rangeKeys = keySpanCache{
+		cmp:           m.cmp,
+		formatKey:     m.formatKey,
+		skl:           &m.rangeKeySkl,
+		constructSpan: rangekey.Decode,
+	}
 
 	if m.arenaBuf == nil {
 		m.arenaBuf = make([]byte, opts.size)
@@ -124,6 +142,7 @@ func newMemTable(opts memTableOptions) *memTable {
 	arena := arenaskl.NewArena(m.arenaBuf)
 	m.skl.Reset(arena, m.cmp)
 	m.rangeDelSkl.Reset(arena, m.cmp)
+	m.rangeKeySkl.Reset(arena, m.cmp)
 	return m
 }
 
@@ -149,25 +168,6 @@ func (m *memTable) readyForFlush() bool {
 	return atomic.LoadInt32(&m.writerRefs) == 0
 }
 
-// Get gets the value for the given key. It returns ErrNotFound if the DB does
-// not contain the key.
-func (m *memTable) get(key []byte) (value []byte, err error) {
-	it := m.skl.NewIter(nil, nil)
-	ikey, val := it.SeekGE(key)
-	if ikey == nil {
-		return nil, ErrNotFound
-	}
-	if !m.equal(key, ikey.UserKey) {
-		return nil, ErrNotFound
-	}
-	switch ikey.Kind() {
-	case InternalKeyKindDelete, InternalKeyKindSingleDelete:
-		return nil, ErrNotFound
-	default:
-		return val, nil
-	}
-}
-
 // Prepare reserves space for the batch in the memtable and references the
 // memtable preventing it from being flushed until the batch is applied. Note
 // that prepare is not thread-safe, while apply is. The caller must call
@@ -190,7 +190,7 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 	}
 
 	var ins arenaskl.Inserter
-	var tombstoneCount uint32
+	var tombstoneCount, rangeKeyCount uint32
 	startSeqNum := seqNum
 	for r := batch.Reader(); ; seqNum++ {
 		kind, ukey, value, ok := r.Next()
@@ -203,6 +203,9 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 		case InternalKeyKindRangeDelete:
 			err = m.rangeDelSkl.Add(ikey, value)
 			tombstoneCount++
+		case InternalKeyKindRangeKeySet, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeyDelete:
+			err = m.rangeKeySkl.Add(ikey, value)
+			rangeKeyCount++
 		case InternalKeyKindLogData:
 			// Don't increment seqNum for LogData, since these are not applied
 			// to the memtable.
@@ -221,6 +224,9 @@ func (m *memTable) apply(batch *Batch, seqNum uint64) error {
 	if tombstoneCount != 0 {
 		m.tombstones.invalidate(tombstoneCount)
 	}
+	if rangeKeyCount != 0 {
+		m.rangeKeys.invalidate(rangeKeyCount)
+	}
 	return nil
 }
 
@@ -235,12 +241,24 @@ func (m *memTable) newFlushIter(o *IterOptions, bytesFlushed *uint64) internalIt
 	return m.skl.NewFlushIter(bytesFlushed)
 }
 
-func (m *memTable) newRangeDelIter(*IterOptions) internalIterator {
-	tombstones := m.tombstones.get(m)
+func (m *memTable) newRangeDelIter(*IterOptions) keyspan.FragmentIterator {
+	tombstones := m.tombstones.get()
 	if tombstones == nil {
 		return nil
 	}
-	return rangedel.NewIter(m.cmp, tombstones)
+	return keyspan.NewIter(m.cmp, tombstones)
+}
+
+func (m *memTable) newRangeKeyIter(*IterOptions) keyspan.FragmentIterator {
+	rangeKeys := m.rangeKeys.get()
+	if rangeKeys == nil {
+		return nil
+	}
+	return keyspan.NewIter(m.cmp, rangeKeys)
+}
+
+func (m *memTable) containsRangeKeys() bool {
+	return atomic.LoadUint32(&m.rangeKeys.atomicCount) > 0
 }
 
 func (m *memTable) availBytes() uint32 {
@@ -262,70 +280,96 @@ func (m *memTable) totalBytes() uint64 {
 	return uint64(m.skl.Arena().Capacity())
 }
 
-func (m *memTable) close() error {
-	return nil
-}
-
 // empty returns whether the MemTable has no key/value pairs.
 func (m *memTable) empty() bool {
 	return m.skl.Size() == memTableEmptySize
 }
 
-// A rangeTombstoneFrags holds a set of fragmented range tombstones generated
-// at a particular "sequence number" for a memtable. Rather than use actual
-// sequence numbers, this cache uses a count of the number of range tombstones
-// in the memTable. Note that the count of range tombstones in a memTable only
-// ever increases, which provides a monotonically increasing sequence.
-type rangeTombstoneFrags struct {
-	count      uint32
-	once       sync.Once
-	tombstones []rangedel.Tombstone
+// A keySpanFrags holds a set of fragmented keyspan.Spans with a particular key
+// kind at a particular moment for a memtable.
+//
+// When a new span of a particular kind is added to the memtable, it may overlap
+// with other spans of the same kind. Instead of performing the fragmentation
+// whenever an iterator requires it, fragments are cached within a keySpanCache
+// type. The keySpanCache uses keySpanFrags to hold the cached fragmented spans.
+//
+// The count of keys (and keys of any given kind) in a memtable only
+// monotonically increases. The count of key spans of a particular kind is used
+// as a stand-in for a 'sequence number'. A keySpanFrags represents the
+// fragmented state of the memtable's keys of a given kind at the moment while
+// there existed `count` keys of that kind in the memtable.
+//
+// It's currently only used to contain fragmented range deletion tombstones.
+type keySpanFrags struct {
+	count uint32
+	once  sync.Once
+	spans []keyspan.Span
 }
 
-// get retrieves the fragmented tombstones, populating them if necessary. Note
-// that the populated tombstone fragments may be built from more than f.count
-// memTable range tombstones, but that is ok for correctness. All we're
-// requiring is that the memTable contains at least f.count range
-// tombstones. This situation can occur if there are multiple concurrent
-// additions of range tombstones and a concurrent reader. The reader can load a
-// tombstoneFrags and populate it even though is has been invalidated
-// (i.e. replaced with a newer tombstoneFrags).
-func (f *rangeTombstoneFrags) get(m *memTable) []rangedel.Tombstone {
+type constructSpan func(ik base.InternalKey, v []byte, keysDst []keyspan.Key) (keyspan.Span, error)
+
+func rangeDelConstructSpan(
+	ik base.InternalKey, v []byte, keysDst []keyspan.Key,
+) (keyspan.Span, error) {
+	return rangedel.Decode(ik, v, keysDst), nil
+}
+
+// get retrieves the fragmented spans, populating them if necessary. Note that
+// the populated span fragments may be built from more than f.count memTable
+// spans, but that is ok for correctness. All we're requiring is that the
+// memTable contains at least f.count keys of the configured kind. This
+// situation can occur if there are multiple concurrent additions of the key
+// kind and a concurrent reader. The reader can load a keySpanFrags and populate
+// it even though is has been invalidated (i.e. replaced with a newer
+// keySpanFrags).
+func (f *keySpanFrags) get(
+	skl *arenaskl.Skiplist, cmp Compare, formatKey base.FormatKey, constructSpan constructSpan,
+) []keyspan.Span {
 	f.once.Do(func() {
-		frag := &rangedel.Fragmenter{
-			Cmp:    m.cmp,
-			Format: m.formatKey,
-			Emit: func(fragmented []rangedel.Tombstone) {
-				f.tombstones = append(f.tombstones, fragmented...)
+		frag := &keyspan.Fragmenter{
+			Cmp:    cmp,
+			Format: formatKey,
+			Emit: func(fragmented keyspan.Span) {
+				f.spans = append(f.spans, fragmented)
 			},
 		}
-		it := m.rangeDelSkl.NewIter(nil, nil)
+		it := skl.NewIter(nil, nil)
+		var keysDst []keyspan.Key
 		for key, val := it.First(); key != nil; key, val = it.Next() {
-			frag.Add(*key, val)
+			s, err := constructSpan(*key, val, keysDst)
+			if err != nil {
+				panic(err)
+			}
+			frag.Add(s)
+			keysDst = s.Keys[len(s.Keys):]
 		}
 		frag.Finish()
 	})
-	return f.tombstones
+	return f.spans
 }
 
-// A rangeTombstoneCache is used to cache a set of fragmented tombstones. The
-// cache is invalidated whenever a tombstone is added to a memTable, and
-// populated when empty when a range-del iterator is created.
-type rangeTombstoneCache struct {
-	count uint32
-	frags unsafe.Pointer
+// A keySpanCache is used to cache a set of fragmented spans. The cache is
+// invalidated whenever a key of the same kind is added to a memTable, and
+// populated when empty when a span iterator of that key kind is created.
+type keySpanCache struct {
+	atomicCount   uint32
+	frags         unsafe.Pointer
+	cmp           Compare
+	formatKey     base.FormatKey
+	constructSpan constructSpan
+	skl           *arenaskl.Skiplist
 }
 
-// Invalidate the current set of cached tombstones, indicating the number of
-// tombstones that were added.
-func (c *rangeTombstoneCache) invalidate(count uint32) {
-	newCount := atomic.AddUint32(&c.count, count)
-	var frags *rangeTombstoneFrags
+// Invalidate the current set of cached spans, indicating the number of
+// spans that were added.
+func (c *keySpanCache) invalidate(count uint32) {
+	newCount := atomic.AddUint32(&c.atomicCount, count)
+	var frags *keySpanFrags
 
 	for {
 		oldPtr := atomic.LoadPointer(&c.frags)
 		if oldPtr != nil {
-			oldFrags := (*rangeTombstoneFrags)(oldPtr)
+			oldFrags := (*keySpanFrags)(oldPtr)
 			if oldFrags.count >= newCount {
 				// Someone else invalidated the cache before us and their invalidation
 				// subsumes ours.
@@ -333,7 +377,7 @@ func (c *rangeTombstoneCache) invalidate(count uint32) {
 			}
 		}
 		if frags == nil {
-			frags = &rangeTombstoneFrags{count: newCount}
+			frags = &keySpanFrags{count: newCount}
 		}
 		if atomic.CompareAndSwapPointer(&c.frags, oldPtr, unsafe.Pointer(frags)) {
 			// We successfully invalidated the cache.
@@ -343,10 +387,10 @@ func (c *rangeTombstoneCache) invalidate(count uint32) {
 	}
 }
 
-func (c *rangeTombstoneCache) get(m *memTable) []rangedel.Tombstone {
-	frags := (*rangeTombstoneFrags)(atomic.LoadPointer(&c.frags))
+func (c *keySpanCache) get() []keyspan.Span {
+	frags := (*keySpanFrags)(atomic.LoadPointer(&c.frags))
 	if frags == nil {
 		return nil
 	}
-	return frags.get(m)
+	return frags.get(c.skl, c.cmp, c.formatKey, c.constructSpan)
 }

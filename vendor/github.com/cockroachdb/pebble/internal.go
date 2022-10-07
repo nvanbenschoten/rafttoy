@@ -18,6 +18,10 @@ const (
 	InternalKeyKindSingleDelete    = base.InternalKeyKindSingleDelete
 	InternalKeyKindRangeDelete     = base.InternalKeyKindRangeDelete
 	InternalKeyKindMax             = base.InternalKeyKindMax
+	InternalKeyKindSetWithDelete   = base.InternalKeyKindSetWithDelete
+	InternalKeyKindRangeKeySet     = base.InternalKeyKindRangeKeySet
+	InternalKeyKindRangeKeyUnset   = base.InternalKeyKindRangeKeyUnset
+	InternalKeyKindRangeKeyDelete  = base.InternalKeyKindRangeKeyDelete
 	InternalKeyKindInvalid         = base.InternalKeyKindInvalid
 	InternalKeySeqNumBatch         = base.InternalKeySeqNumBatch
 	InternalKeySeqNumMax           = base.InternalKeySeqNumMax
@@ -28,3 +32,7 @@ const (
 type InternalKey = base.InternalKey
 
 type internalIterator = base.InternalIterator
+
+// ErrCorruption is a marker to indicate that data in a file (WAL, MANIFEST,
+// sstable) isn't in the expected format.
+var ErrCorruption = base.ErrCorruption

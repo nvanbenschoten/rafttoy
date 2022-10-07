@@ -77,8 +77,9 @@ func (d *DB) loadReadState() *readState {
 }
 
 // updateReadStateLocked creates a new readState from the current version and
-// list of memtables. Requires DB.mu is held. If checker is not nil, it is called after installing
-// the new readState
+// list of memtables. Requires DB.mu is held. If checker is not nil, it is
+// called after installing the new readState. If atomicFunc is not nil, it is
+// executed atomically with the transition to the new read state.
 func (d *DB) updateReadStateLocked(checker func(*DB) error) {
 	s := &readState{
 		db:        d,

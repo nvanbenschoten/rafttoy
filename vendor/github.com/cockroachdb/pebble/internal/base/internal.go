@@ -18,23 +18,47 @@ type InternalKeyKind uint8
 // These constants are part of the file format, and should not be changed.
 const (
 	InternalKeyKindDelete  InternalKeyKind = 0
-	InternalKeyKindSet                     = 1
-	InternalKeyKindMerge                   = 2
-	InternalKeyKindLogData                 = 3
-	// InternalKeyKindColumnFamilyDeletion                     = 4
-	// InternalKeyKindColumnFamilyValue                        = 5
-	// InternalKeyKindColumnFamilyMerge                        = 6
-	InternalKeyKindSingleDelete = 7
-	// InternalKeyKindColumnFamilySingleDelete                 = 8
-	// InternalKeyKindBeginPrepareXID                          = 9
-	// InternalKeyKindEndPrepareXID                            = 10
-	// InternalKeyKindCommitXID                                = 11
-	// InternalKeyKindRollbackXID                              = 12
-	// InternalKeyKindNoop                                     = 13
-	// InternalKeyKindColumnFamilyRangeDelete                  = 14
-	InternalKeyKindRangeDelete = 15
-	// InternalKeyKindColumnFamilyBlobIndex                    = 16
-	// InternalKeyKindBlobIndex                                = 17
+	InternalKeyKindSet     InternalKeyKind = 1
+	InternalKeyKindMerge   InternalKeyKind = 2
+	InternalKeyKindLogData InternalKeyKind = 3
+	//InternalKeyKindColumnFamilyDeletion     InternalKeyKind = 4
+	//InternalKeyKindColumnFamilyValue        InternalKeyKind = 5
+	//InternalKeyKindColumnFamilyMerge        InternalKeyKind = 6
+	InternalKeyKindSingleDelete InternalKeyKind = 7
+	//InternalKeyKindColumnFamilySingleDelete InternalKeyKind = 8
+	//InternalKeyKindBeginPrepareXID          InternalKeyKind = 9
+	//InternalKeyKindEndPrepareXID            InternalKeyKind = 10
+	//InternalKeyKindCommitXID                InternalKeyKind = 11
+	//InternalKeyKindRollbackXID              InternalKeyKind = 12
+	//InternalKeyKindNoop                     InternalKeyKind = 13
+	//InternalKeyKindColumnFamilyRangeDelete  InternalKeyKind = 14
+	InternalKeyKindRangeDelete InternalKeyKind = 15
+	//InternalKeyKindColumnFamilyBlobIndex    InternalKeyKind = 16
+	//InternalKeyKindBlobIndex                InternalKeyKind = 17
+
+	// InternalKeyKindSeparator is a key used for separator / successor keys
+	// written to sstable block indexes.
+	//
+	// NOTE: the RocksDB value has been repurposed. This was done to ensure that
+	// keys written to block indexes with value "17" (when 17 happened to be the
+	// max value, and InternalKeyKindMax was therefore set to 17), remain stable
+	// when new key kinds are supported in Pebble.
+	InternalKeyKindSeparator InternalKeyKind = 17
+
+	// InternalKeyKindSetWithDelete keys are SET keys that have met with a
+	// DELETE or SINGLEDEL key in a prior compaction. This key kind is
+	// specific to Pebble. See
+	// https://github.com/cockroachdb/pebble/issues/1255.
+	InternalKeyKindSetWithDelete InternalKeyKind = 18
+
+	// InternalKeyKindRangeKeyDelete removes all range keys within a key range.
+	// See the internal/rangekey package for more details.
+	InternalKeyKindRangeKeyDelete InternalKeyKind = 19
+	// InternalKeyKindRangeKeySet and InternalKeyKindRangeUnset represent
+	// keys that set and unset values associated with ranges of key
+	// space. See the internal/rangekey package for more details.
+	InternalKeyKindRangeKeyUnset InternalKeyKind = 20
+	InternalKeyKindRangeKeySet   InternalKeyKind = 21
 
 	// This maximum value isn't part of the file format. It's unlikely,
 	// but future extensions may increase this value.
@@ -45,7 +69,11 @@ const (
 	// which sorts 'less than or equal to' any other valid internalKeyKind, when
 	// searching for any kind of internal key formed by a certain user key and
 	// seqNum.
-	InternalKeyKindMax InternalKeyKind = 17
+	InternalKeyKindMax InternalKeyKind = 21
+
+	// InternalKeyZeroSeqnumMaxTrailer is the largest trailer with a
+	// zero sequence number.
+	InternalKeyZeroSeqnumMaxTrailer = uint64(InternalKeyKindInvalid)
 
 	// A marker for an invalid key.
 	InternalKeyKindInvalid InternalKeyKind = 255
@@ -62,18 +90,28 @@ const (
 	// when a range deletion tombstone is the largest key in an sstable. This is
 	// necessary because sstable boundaries are inclusive, while the end key of a
 	// range deletion tombstone is exclusive.
-	InternalKeyRangeDeleteSentinel = (InternalKeySeqNumMax << 8) | InternalKeyKindRangeDelete
+	InternalKeyRangeDeleteSentinel = (InternalKeySeqNumMax << 8) | uint64(InternalKeyKindRangeDelete)
+
+	// InternalKeyBoundaryRangeKey is the marker for a range key boundary. This
+	// sequence number and kind are used during interleaved range key and point
+	// iteration to allow an iterator to stop at range key start keys where
+	// there exists no point key.
+	InternalKeyBoundaryRangeKey = (InternalKeySeqNumMax << 8) | uint64(InternalKeyKindRangeKeySet)
 )
 
 var internalKeyKindNames = []string{
-	InternalKeyKindDelete:       "DEL",
-	InternalKeyKindSet:          "SET",
-	InternalKeyKindMerge:        "MERGE",
-	InternalKeyKindLogData:      "LOGDATA",
-	InternalKeyKindSingleDelete: "SINGLEDEL",
-	InternalKeyKindRangeDelete:  "RANGEDEL",
-	InternalKeyKindMax:          "MAX",
-	InternalKeyKindInvalid:      "INVALID",
+	InternalKeyKindDelete:         "DEL",
+	InternalKeyKindSet:            "SET",
+	InternalKeyKindMerge:          "MERGE",
+	InternalKeyKindLogData:        "LOGDATA",
+	InternalKeyKindSingleDelete:   "SINGLEDEL",
+	InternalKeyKindRangeDelete:    "RANGEDEL",
+	InternalKeyKindSeparator:      "SEPARATOR",
+	InternalKeyKindSetWithDelete:  "SETWITHDEL",
+	InternalKeyKindRangeKeySet:    "RANGEKEYSET",
+	InternalKeyKindRangeKeyUnset:  "RANGEKEYUNSET",
+	InternalKeyKindRangeKeyDelete: "RANGEKEYDEL",
+	InternalKeyKindInvalid:        "INVALID",
 }
 
 func (k InternalKeyKind) String() string {
@@ -108,8 +146,14 @@ func MakeInternalKey(userKey []byte, seqNum uint64, kind InternalKeyKind) Intern
 	}
 }
 
+// MakeTrailer constructs an internal key trailer from the specified sequence
+// number and kind.
+func MakeTrailer(seqNum uint64, kind InternalKeyKind) uint64 {
+	return (seqNum << 8) | uint64(kind)
+}
+
 // MakeSearchKey constructs an internal key that is appropriate for searching
-// for a the specified user key. The search key contain the maximual sequence
+// for a the specified user key. The search key contain the maximal sequence
 // number and kind ensuring that it sorts before any other internal keys for
 // the same user key.
 func MakeSearchKey(userKey []byte) InternalKey {
@@ -129,14 +173,28 @@ func MakeRangeDeleteSentinelKey(userKey []byte) InternalKey {
 	}
 }
 
+// MakeExclusiveSentinelKey constructs an internal key that is an
+// exclusive sentinel key, used as the upper boundary for an sstable
+// when a ranged key is the largest key in an sstable.
+func MakeExclusiveSentinelKey(kind InternalKeyKind, userKey []byte) InternalKey {
+	return InternalKey{
+		UserKey: userKey,
+		Trailer: (InternalKeySeqNumMax << 8) | uint64(kind),
+	}
+}
+
 var kindsMap = map[string]InternalKeyKind{
-	"DEL":       InternalKeyKindDelete,
-	"SINGLEDEL": InternalKeyKindSingleDelete,
-	"RANGEDEL":  InternalKeyKindRangeDelete,
-	"SET":       InternalKeyKindSet,
-	"MERGE":     InternalKeyKindMerge,
-	"INVALID":   InternalKeyKindInvalid,
-	"MAX":       InternalKeyKindMax,
+	"DEL":           InternalKeyKindDelete,
+	"SINGLEDEL":     InternalKeyKindSingleDelete,
+	"RANGEDEL":      InternalKeyKindRangeDelete,
+	"SET":           InternalKeyKindSet,
+	"MERGE":         InternalKeyKindMerge,
+	"INVALID":       InternalKeyKindInvalid,
+	"SEPARATOR":     InternalKeyKindSeparator,
+	"SETWITHDEL":    InternalKeyKindSetWithDelete,
+	"RANGEKEYSET":   InternalKeyKindRangeKeySet,
+	"RANGEKEYUNSET": InternalKeyKindRangeKeyUnset,
+	"RANGEKEYDEL":   InternalKeyKindRangeKeyDelete,
 }
 
 // ParseInternalKey parses the string representation of an internal key. The
@@ -160,9 +218,21 @@ func ParseInternalKey(s string) InternalKey {
 	return MakeInternalKey([]byte(ukey), seqNum, kind)
 }
 
+// ParseKind parses the string representation of an internal key kind.
+func ParseKind(s string) InternalKeyKind {
+	kind, ok := kindsMap[s]
+	if !ok {
+		panic(fmt.Sprintf("unknown kind: %q", s))
+	}
+	return kind
+}
+
+// InternalTrailerLen is the number of bytes used to encode InternalKey.Trailer.
+const InternalTrailerLen = 8
+
 // DecodeInternalKey decodes an encoded internal key. See InternalKey.Encode().
 func DecodeInternalKey(encodedKey []byte) InternalKey {
-	n := len(encodedKey) - 8
+	n := len(encodedKey) - InternalTrailerLen
 	var trailer uint64
 	if n >= 0 {
 		trailer = binary.LittleEndian.Uint64(encodedKey[n:])
@@ -180,8 +250,8 @@ func DecodeInternalKey(encodedKey []byte) InternalKey {
 // InternalCompare compares two internal keys using the specified comparison
 // function. For equal user keys, internal keys compare in descending sequence
 // number order. For equal user keys and sequence numbers, internal keys
-// compare in descending kind order (though this should never happen in
-// practice).
+// compare in descending kind order (this may happen in practice among range
+// keys).
 func InternalCompare(userCmp Compare, a, b InternalKey) int {
 	if x := userCmp(a.UserKey, b.UserKey); x != 0 {
 		return x
@@ -224,7 +294,7 @@ func (k InternalKey) Separator(
 		// any sequence number and kind here to create a valid separator key. We
 		// use the max sequence number to match the behavior of LevelDB and
 		// RocksDB.
-		return MakeInternalKey(buf, InternalKeySeqNumMax, InternalKeyKindMax)
+		return MakeInternalKey(buf, InternalKeySeqNumMax, InternalKeyKindSeparator)
 	}
 	return k
 }
@@ -241,7 +311,7 @@ func (k InternalKey) Successor(cmp Compare, succ Successor, buf []byte) Internal
 		// any sequence number and kind here to create a valid separator key. We
 		// use the max sequence number to match the behavior of LevelDB and
 		// RocksDB.
-		return MakeInternalKey(buf, InternalKeySeqNumMax, InternalKeyKindMax)
+		return MakeInternalKey(buf, InternalKeySeqNumMax, InternalKeyKindSeparator)
 	}
 	return k
 }
@@ -263,9 +333,28 @@ func (k InternalKey) SeqNum() uint64 {
 
 // Visible returns true if the key is visible at the specified snapshot
 // sequence number.
-func (k InternalKey) Visible(snapshot uint64) bool {
-	seqNum := k.SeqNum()
-	return seqNum < snapshot || (seqNum&InternalKeySeqNumBatch) != 0
+func (k InternalKey) Visible(snapshot, batchSnapshot uint64) bool {
+	return Visible(k.SeqNum(), snapshot, batchSnapshot)
+}
+
+// Visible returns true if a key with the provided sequence number is visible at
+// the specified snapshot sequence numbers.
+func Visible(seqNum uint64, snapshot, batchSnapshot uint64) bool {
+	// There are two snapshot sequence numbers, one for committed keys and one
+	// for batch keys. If a seqNum is less than `snapshot`, then seqNum
+	// corresponds to a committed key that is visible. If seqNum has its batch
+	// bit set, then seqNum corresponds to an uncommitted batch key. Its
+	// visible if its snapshot is less than batchSnapshot.
+	//
+	// There's one complication. The maximal sequence number
+	// (`InternalKeySeqNumMax`) is used across Pebble for exclusive sentinel
+	// keys and other purposes. The maximal sequence number has its batch bit
+	// set, but it can never be < `batchSnapshot`, since there is no expressible
+	// larger snapshot. We dictate that the maximal sequence number is always
+	// visible.
+	return seqNum < snapshot ||
+		((seqNum&InternalKeySeqNumBatch) != 0 && seqNum < batchSnapshot) ||
+		seqNum == InternalKeySeqNumMax
 }
 
 // SetKind sets the kind component of the key.
@@ -285,7 +374,7 @@ func (k InternalKey) Valid() bool {
 
 // Clone clones the storage for the UserKey component of the key.
 func (k InternalKey) Clone() InternalKey {
-	if k.UserKey == nil {
+	if len(k.UserKey) == 0 {
 		return k
 	}
 	return InternalKey{
@@ -304,6 +393,20 @@ func (k InternalKey) Pretty(f FormatKey) fmt.Formatter {
 	return prettyInternalKey{k, f}
 }
 
+// IsExclusiveSentinel returns whether this internal key excludes point keys
+// with the same user key if used as an end boundary. See the comment on
+// InternalKeyRangeDeletionSentinel.
+func (k InternalKey) IsExclusiveSentinel() bool {
+	switch kind := k.Kind(); kind {
+	case InternalKeyKindRangeDelete:
+		return k.Trailer == InternalKeyRangeDeleteSentinel
+	case InternalKeyKindRangeKeyDelete, InternalKeyKindRangeKeyUnset, InternalKeyKindRangeKeySet:
+		return (k.Trailer >> 8) == InternalKeySeqNumMax
+	default:
+		return false
+	}
+}
+
 type prettyInternalKey struct {
 	InternalKey
 	formatKey FormatKey
@@ -311,4 +414,17 @@ type prettyInternalKey struct {
 
 func (k prettyInternalKey) Format(s fmt.State, c rune) {
 	fmt.Fprintf(s, "%s#%d,%s", k.formatKey(k.UserKey), k.SeqNum(), k.Kind())
+}
+
+// ParsePrettyInternalKey parses the pretty string representation of an
+// internal key. The format is <user-key>#<seq-num>,<kind>.
+func ParsePrettyInternalKey(s string) InternalKey {
+	x := strings.FieldsFunc(s, func(c rune) bool { return c == '#' || c == ',' })
+	ukey := x[0]
+	kind, ok := kindsMap[x[2]]
+	if !ok {
+		panic(fmt.Sprintf("unknown kind: %q", x[2]))
+	}
+	seqNum, _ := strconv.ParseUint(x[1], 10, 64)
+	return MakeInternalKey([]byte(ukey), seqNum, kind)
 }

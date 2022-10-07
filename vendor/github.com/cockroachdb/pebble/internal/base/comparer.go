@@ -66,14 +66,31 @@ type Separator func(dst, a, b []byte) []byte
 // key must be valid to pass to Compare.
 type Successor func(dst, a []byte) []byte
 
+// ImmediateSuccessor is invoked with a prefix key ([Split(a) == len(a)]) and
+// returns the smallest key that is larger than the given prefix a.
+// ImmediateSuccessor must return a prefix key k such that:
+//
+//   Split(k) == len(k) and Compare(k, a) > 0
+//
+// and there exists no representable k2 such that:
+//
+//   Split(k2) == len(k2) and Compare(k2, a) > 0 and Compare(k2, k) < 0
+//
+// As an example, an implementation built on the natural byte ordering using
+// bytes.Compare could append a `\0` to `a`.
+//
+// The dst parameter may be used to store the returned key, though it is valid
+// to pass nil. The returned key must be valid to pass to Compare.
+type ImmediateSuccessor func(dst, a []byte) []byte
+
 // Split returns the length of the prefix of the user key that corresponds to
 // the key portion of an MVCC encoding scheme to enable the use of prefix bloom
 // filters.
 //
 // The method will only ever be called with valid MVCC keys, that is, keys that
-// the user could potentially store in the database. Typically this means that
-// the method must only handle valid MVCC encoded keys and should panic on any
-// other input.
+// the user could potentially store in the database. Pebble does not know which
+// keys are MVCC keys and which are not, and may call Split on both MVCC keys
+// and non-MVCC keys.
 //
 // A trivial MVCC scheme is one in which Split() returns len(a). This
 // corresponds to assigning a constant version to each key in the database. For
@@ -81,23 +98,38 @@ type Successor func(dst, a []byte) []byte
 //
 // The returned prefix must have the following properties:
 //
-// 1) bytes.HasPrefix(a, prefix(a))
-// 2) Compare(prefix(a), a) <= 0,
-// 3) If Compare(a, b) <= 0, then Compare(prefix(a), prefix(b)) <= 0
-// 4) if b begins with a, then prefix(b) = prefix(a).
+// 1) The prefix must be a byte prefix:
+//
+//    bytes.HasPrefix(a, prefix(a))
+//
+// 2) A key consisting of just a prefix must sort before all other keys with
+//    that prefix:
+//
+//    Compare(prefix(a), a) < 0 if len(suffix(a)) > 0
+//
+// 3) Prefixes must be used to order keys before suffixes:
+//
+//    If Compare(a, b) <= 0, then Compare(prefix(a), prefix(b)) <= 0
+//
+// 4) Suffixes themselves must be valid keys and comparable, respecting the same
+//    ordering as within a key.
+//
+//    If Compare(prefix(a), prefix(b)) == 0, then Compare(suffix(a), suffix(b)) == Compare(a, b)
+//
 type Split func(a []byte) int
 
 // Comparer defines a total ordering over the space of []byte keys: a 'less
 // than' relationship.
 type Comparer struct {
-	Compare        Compare
-	Equal          Equal
-	AbbreviatedKey AbbreviatedKey
-	FormatKey      FormatKey
-	FormatValue    FormatValue
-	Separator      Separator
-	Split          Split
-	Successor      Successor
+	Compare            Compare
+	Equal              Equal
+	AbbreviatedKey     AbbreviatedKey
+	FormatKey          FormatKey
+	FormatValue        FormatValue
+	Separator          Separator
+	Split              Split
+	Successor          Successor
+	ImmediateSuccessor ImmediateSuccessor
 
 	// Name is the name of the comparer.
 	//
@@ -179,6 +211,10 @@ var DefaultComparer = &Comparer{
 		return append(dst, a...)
 	},
 
+	ImmediateSuccessor: func(dst, a []byte) (ret []byte) {
+		return append(append(dst, a...), 0x00)
+	},
+
 	// This name is part of the C++ Level-DB implementation's default file
 	// format, and should not be changed.
 	Name: "leveldb.BytewiseComparator",
@@ -190,6 +226,12 @@ func SharedPrefixLen(a, b []byte) int {
 	i, n := 0, len(a)
 	if n > len(b) {
 		n = len(b)
+	}
+	asUint64 := func(c []byte, i int) uint64 {
+		return binary.LittleEndian.Uint64(c[i:])
+	}
+	for i < n-7 && asUint64(a, i) == asUint64(b, i) {
+		i += 8
 	}
 	for i < n && a[i] == b[i] {
 		i++

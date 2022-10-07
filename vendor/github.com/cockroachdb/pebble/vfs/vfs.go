@@ -18,6 +18,9 @@ import (
 //
 // Typically, it will be an *os.File, but test code may choose to substitute
 // memory-backed implementations.
+//
+// Write-oriented operations (Write, Sync) must be called sequentially: At most
+// 1 call to Write or Sync may be executed at any given time.
 type File interface {
 	io.Closer
 	io.Reader
@@ -42,8 +45,9 @@ type OpenOption interface {
 // The names are filepath names: they may be / separated or \ separated,
 // depending on the underlying operating system.
 type FS interface {
-	// Create creates the named file for writing, truncating it if it already
-	// exists.
+	// Create creates the named file for reading and writing. If a file
+	// already exists at the provided name, it's removed first ensuring the
+	// resulting file descriptor points to a new inode.
 	Create(name string) (File, error)
 
 	// Link creates newname as a hard link to the oldname file.
@@ -119,9 +123,19 @@ type FS interface {
 	// PathDir returns all but the last element of path, typically the path's directory.
 	PathDir(path string) string
 
-	// GetFreeSpace returns the amount of free disk space for the filesystem
-	// where path is any file or directory within that filesystem.
-	GetFreeSpace(path string) (uint64, error)
+	// GetDiskUsage returns disk space statistics for the filesystem where
+	// path is any file or directory within that filesystem.
+	GetDiskUsage(path string) (DiskUsage, error)
+}
+
+// DiskUsage summarizes disk space usage on a filesystem.
+type DiskUsage struct {
+	// Total disk space available to the current process in bytes.
+	AvailBytes uint64
+	// Total disk space in bytes.
+	TotalBytes uint64
+	// Used disk space in bytes.
+	UsedBytes uint64
 }
 
 // Default is a FS implementation backed by the underlying operating system's
@@ -131,7 +145,23 @@ var Default FS = defaultFS{}
 type defaultFS struct{}
 
 func (defaultFS) Create(name string) (File, error) {
-	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC|syscall.O_CLOEXEC, 0666)
+	const openFlags = os.O_RDWR | os.O_CREATE | os.O_EXCL | syscall.O_CLOEXEC
+
+	f, err := os.OpenFile(name, openFlags, 0666)
+	// If the file already exists, remove it and try again.
+	//
+	// NB: We choose to remove the file instead of truncating it, despite the
+	// fact that we can't do so atomically, because it's more resistant to
+	// misuse when using hard links.
+
+	// We must loop in case another goroutine/thread/process is also
+	// attempting to create the a file at the same path.
+	for oserror.IsExist(err) {
+		if removeErr := os.Remove(name); removeErr != nil && !oserror.IsNotExist(removeErr) {
+			return f, errors.WithStack(removeErr)
+		}
+		f, err = os.OpenFile(name, openFlags, 0666)
+	}
 	return f, errors.WithStack(err)
 }
 
@@ -314,3 +344,6 @@ func Root(fs FS) FS {
 	}
 	return fs
 }
+
+// ErrUnsupported may be returned a FS when it does not support an operation.
+var ErrUnsupported = errors.New("pebble: not supported")

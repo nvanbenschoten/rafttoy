@@ -126,10 +126,6 @@ func leafToNode(ln *leafNode) *node {
 	return (*node)(unsafe.Pointer(ln))
 }
 
-func nodeToLeaf(n *node) *leafNode {
-	return (*leafNode)(unsafe.Pointer(n))
-}
-
 func newLeafNode() *node {
 	n := leafToNode(new(leafNode))
 	n.leaf = true
@@ -579,6 +575,26 @@ func (n *node) rebalanceOrMerge(i int) {
 	}
 }
 
+func (n *node) invalidateAnnotation(a Annotator) {
+	// Find this annotator's annotation on this node.
+	var annot *annotation
+	for i := range n.annot {
+		if n.annot[i].annotator == a {
+			annot = &n.annot[i]
+		}
+	}
+
+	if annot != nil && annot.valid {
+		annot.valid = false
+		annot.v = a.Zero(annot.v)
+	}
+	if !n.leaf {
+		for i := int16(0); i <= n.count; i++ {
+			n.children[i].invalidateAnnotation(a)
+		}
+	}
+}
+
 func (n *node) annotation(a Annotator) (interface{}, bool) {
 	// Find this annotator's annotation on this node.
 	var annot *annotation
@@ -903,7 +919,7 @@ func cmpIter(a, b iterator) int {
 
 	// Each iterator has a stack of frames marking the path from the root node
 	// to the current iterator position. We walk both paths formed by the
-	// iterators' stacks simulatenously, descending from the shared root node,
+	// iterators' stacks simultaneously, descending from the shared root node,
 	// always comparing nodes at the same level in the tree.
 	//
 	// If the iterators' paths ever diverge and point to different nodes, the

@@ -33,10 +33,14 @@ func flushExternalTable(untypedDB interface{}, path string, originalMeta *fileMe
 		FileNum:        fileNum,
 		Size:           originalMeta.Size,
 		CreationTime:   time.Now().Unix(),
-		Smallest:       originalMeta.Smallest,
-		Largest:        originalMeta.Largest,
 		SmallestSeqNum: originalMeta.SmallestSeqNum,
 		LargestSeqNum:  originalMeta.LargestSeqNum,
+	}
+	if originalMeta.HasPointKeys {
+		m.ExtendPointKeyBounds(d.cmp, originalMeta.SmallestPointKey, originalMeta.LargestPointKey)
+	}
+	if originalMeta.HasRangeKeys {
+		m.ExtendRangeKeyBounds(d.cmp, originalMeta.SmallestRangeKey, originalMeta.LargestRangeKey)
 	}
 
 	// Hard link the sstable into the DB directory.
@@ -60,17 +64,17 @@ func flushExternalTable(untypedDB interface{}, path string, originalMeta *fileMe
 	d.mu.Lock()
 	d.mu.versions.logLock()
 	ve := &versionEdit{
-		NewFiles: []newFileEntry{newFileEntry{Level: 0, Meta: m}},
+		NewFiles: []newFileEntry{{Level: 0, Meta: m}},
 	}
 	metrics := map[int]*LevelMetrics{
-		0: &LevelMetrics{
+		0: {
 			NumFiles:       1,
 			Size:           int64(m.Size),
 			BytesIngested:  m.Size,
 			TablesIngested: 1,
 		},
 	}
-	err := d.mu.versions.logAndApply(jobID, ve, metrics, d.dataDir, func() []compactionInfo {
+	err := d.mu.versions.logAndApply(jobID, ve, metrics, false /* forceRotation */, func() []compactionInfo {
 		return d.getInProgressCompactionInfoLocked(nil)
 	})
 	if err != nil {
@@ -83,7 +87,7 @@ func flushExternalTable(untypedDB interface{}, path string, originalMeta *fileMe
 	}
 	d.updateReadStateLocked(d.opts.DebugCheck)
 	d.updateTableStatsLocked(ve.NewFiles)
-	d.deleteObsoleteFiles(jobID)
+	d.deleteObsoleteFiles(jobID, true /* waitForOngoing */)
 	d.maybeScheduleCompaction()
 	d.mu.Unlock()
 	return nil

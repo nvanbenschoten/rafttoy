@@ -42,26 +42,32 @@ import "fmt"
 // support prefix iteration mode, and can implement SeekPrefixGE by forwarding
 // to SeekGE.
 //
-// Bounds, [lower, upper), can be set on iterators, either using the
-// SetBounds() function in the interface, or in implementation specific ways
-// during iterator creation. The forward positioning routines (SeekGE, First,
-// and Next) only check the upper bound. The reverse positioning routines
-// (SeekLT, Last, and Prev) only check the lower bound. It is up to the caller
-// to ensure that the forward positioning routines respect the lower bound and
-// the reverse positioning routines respect the upper bound (i.e. calling
-// SeekGE instead of First if there is a lower bound, and SeekLT instead of
-// Last if there is an upper bound). This imposition is done in order to
-// elevate that enforcement to the caller (generally pebble.Iterator or
-// pebble.mergingIter) rather than having it duplicated in every
-// InternalIterator implementation. Additionally, the caller needs to ensure
-// that SeekGE/SeekPrefixGE are not called with a key > the upper bound, and
-// SeekLT is not called with a key < the lower bound.
-// InternalIterator implementations are required to respect the iterator
-// bounds, never returning records outside of the bounds with one exception:
-// an iterator may generate synthetic RANGEDEL marker records. See
+// Bounds, [lower, upper), can be set on iterators, either using the SetBounds()
+// function in the interface, or in implementation specific ways during iterator
+// creation. The forward positioning routines (SeekGE, First, and Next) only
+// check the upper bound. The reverse positioning routines (SeekLT, Last, and
+// Prev) only check the lower bound. It is up to the caller to ensure that the
+// forward positioning routines respect the lower bound and the reverse
+// positioning routines respect the upper bound (i.e. calling SeekGE instead of
+// First if there is a lower bound, and SeekLT instead of Last if there is an
+// upper bound). This imposition is done in order to elevate that enforcement to
+// the caller (generally pebble.Iterator or pebble.mergingIter) rather than
+// having it duplicated in every InternalIterator implementation.
+//
+// Additionally, the caller needs to ensure that SeekGE/SeekPrefixGE are not
+// called with a key > the upper bound, and SeekLT is not called with a key <
+// the lower bound. InternalIterator implementations are required to respect
+// the iterator bounds, never returning records outside of the bounds with one
+// exception: an iterator may generate synthetic RANGEDEL marker records. See
 // levelIter.syntheticBoundary for the sole existing example of this behavior.
-// Specifically, levelIter can return synthetic keys whose user key is equal
-// to the lower/upper bound.
+// Specifically, levelIter can return synthetic keys whose user key is equal to
+// the lower/upper bound.
+//
+// The bounds provided to an internal iterator must remain valid until a
+// subsequent call to SetBounds has returned. This requirement exists so that
+// iterator implementations may compare old and new bounds to apply low-level
+// optimizations. The pebble.Iterator satisfies this requirement by maintaining
+// two bound buffers and switching between them.
 //
 // An iterator must be closed after use, but it is not necessary to read an
 // iterator until exhaustion.
@@ -85,7 +91,7 @@ type InternalIterator interface {
 	// is pointing at a valid entry, and (nil, nil) otherwise. Note that SeekGE
 	// only checks the upper bound. It is up to the caller to ensure that key
 	// is greater than or equal to the lower bound.
-	SeekGE(key []byte) (*InternalKey, []byte)
+	SeekGE(key []byte, flags SeekGEFlags) (*InternalKey, []byte)
 
 	// SeekPrefixGE moves the iterator to the first key/value pair whose key is
 	// greater than or equal to the given key. Returns the key and value if the
@@ -110,14 +116,14 @@ type InternalIterator interface {
 	// not supporting reverse iteration in prefix iteration mode until a
 	// different positioning routine (SeekGE, SeekLT, First or Last) switches the
 	// iterator out of prefix iteration.
-	SeekPrefixGE(prefix, key []byte) (*InternalKey, []byte)
+	SeekPrefixGE(prefix, key []byte, flags SeekGEFlags) (*InternalKey, []byte)
 
 	// SeekLT moves the iterator to the last key/value pair whose key is less
 	// than the given key. Returns the key and value if the iterator is pointing
 	// at a valid entry, and (nil, nil) otherwise. Note that SeekLT only checks
 	// the lower bound. It is up to the caller to ensure that key is less than
 	// the upper bound.
-	SeekLT(key []byte) (*InternalKey, []byte)
+	SeekLT(key []byte, flags SeekLTFlags) (*InternalKey, []byte)
 
 	// First moves the iterator the the first key/value pair. Returns the key and
 	// value if the iterator is pointing at a valid entry, and (nil, nil)
@@ -167,7 +173,185 @@ type InternalIterator interface {
 	// SetBounds sets the lower and upper bounds for the iterator. Note that the
 	// result of Next and Prev will be undefined until the iterator has been
 	// repositioned with SeekGE, SeekPrefixGE, SeekLT, First, or Last.
+	//
+	// The bounds provided must remain valid until a subsequent call to
+	// SetBounds has returned. This requirement exists so that iterator
+	// implementations may compare old and new bounds to apply low-level
+	// optimizations.
 	SetBounds(lower, upper []byte)
 
 	fmt.Stringer
+}
+
+// SeekGEFlags holds flags that may configure the behavior of a forward seek.
+// Not all flags are relevant to all iterators.
+type SeekGEFlags uint8
+
+const (
+	seekGEFlagTrySeekUsingNext uint8 = iota
+	seekGEFlagRelativeSeek
+	seekGEFlagBatchJustRefreshed
+)
+
+// SeekGEFlagsNone is the default value of SeekGEFlags, with all flags disabled.
+const SeekGEFlagsNone = SeekGEFlags(0)
+
+// TrySeekUsingNext indicates whether a performance optimization was enabled
+// by a caller, indicating the caller has not done any action to move this
+// iterator beyond the first key that would be found if this iterator were to
+// honestly do the intended seek. For example, say the caller did a
+// SeekGE(k1...), followed by SeekGE(k2...) where k1 <= k2, without any
+// intermediate positioning calls. The caller can safely specify true for this
+// parameter in the second call. As another example, say the caller did do one
+// call to Next between the two Seek calls, and k1 < k2. Again, the caller can
+// safely specify a true value for this parameter. Note that a false value is
+// always safe. The callee is free to ignore the true value if its
+// implementation does not permit this optimization.
+//
+// We make the caller do this determination since a string comparison of k1, k2
+// is not necessarily cheap, and there may be many iterators in the iterator
+// stack. Doing it once at the root of the iterator stack is cheaper.
+//
+// This optimization could also be applied to SeekLT (where it would be
+// trySeekUsingPrev). We currently only do it for SeekPrefixGE and SeekGE
+// because this is where this optimization helps the performance of CockroachDB.
+// The SeekLT cases in CockroachDB are typically accompanied with bounds that
+// change between seek calls, and is optimized inside certain iterator
+// implementations, like singleLevelIterator, without any extra parameter
+// passing (though the same amortization of string comparisons could be done to
+// improve that optimization, by making the root of the iterator stack do it).
+func (s SeekGEFlags) TrySeekUsingNext() bool { return (s & (1 << seekGEFlagTrySeekUsingNext)) != 0 }
+
+// RelativeSeek is set when in the course of a forward positioning operation, a
+// higher-level iterator seeks a lower-level iterator to a larger key than the
+// one at the current iterator position.
+//
+// Concretely, this occurs when the merging iterator observes a range deletion
+// covering the key at a level's current position, and the merging iterator
+// seeks the level to the range deletion's end key. During lazy-combined
+// iteration, this flag signals to the level iterator that the seek is NOT an
+// absolute-positioning operation from the perspective of the pebble.Iterator,
+// and the level iterator must look for range keys in tables between the current
+// iterator position and the new seeked position.
+func (s SeekGEFlags) RelativeSeek() bool { return (s & (1 << seekGEFlagRelativeSeek)) != 0 }
+
+// BatchJustRefreshed is set by Seek[Prefix]GE when an iterator's view of an
+// indexed batch was just refreshed. It serves as a signal to the batch iterator
+// to ignore the TrySeekUsingNext optimization, because the external knowledge
+// imparted by the TrySeekUsingNext flag does not apply to the batch iterator's
+// position. See (pebble.Iterator).batchJustRefreshed.
+func (s SeekGEFlags) BatchJustRefreshed() bool { return (s & (1 << seekGEFlagBatchJustRefreshed)) != 0 }
+
+// EnableTrySeekUsingNext returns the provided flags with the
+// try-seek-using-next optimization enabled. See TrySeekUsingNext for an
+// explanation of this optimization.
+func (s SeekGEFlags) EnableTrySeekUsingNext() SeekGEFlags {
+	return s | (1 << seekGEFlagTrySeekUsingNext)
+}
+
+// DisableTrySeekUsingNext returns the provided flags with the
+// try-seek-using-next optimization disabled.
+func (s SeekGEFlags) DisableTrySeekUsingNext() SeekGEFlags {
+	return s &^ (1 << seekGEFlagTrySeekUsingNext)
+}
+
+// EnableRelativeSeek returns the provided flags with the relative-seek flag
+// enabled. See RelativeSeek for an explanation of this flag's use.
+func (s SeekGEFlags) EnableRelativeSeek() SeekGEFlags {
+	return s | (1 << seekGEFlagRelativeSeek)
+}
+
+// DisableRelativeSeek returns the provided flags with the relative-seek flag
+// disabled.
+func (s SeekGEFlags) DisableRelativeSeek() SeekGEFlags {
+	return s &^ (1 << seekGEFlagRelativeSeek)
+}
+
+// EnableBatchJustRefreshed returns the provided flags with the
+// batch-just-refreshed bit set. See BatchJustRefreshed for an explanation of
+// this flag.
+func (s SeekGEFlags) EnableBatchJustRefreshed() SeekGEFlags {
+	return s | (1 << seekGEFlagBatchJustRefreshed)
+}
+
+// DisableBatchJustRefreshed returns the provided flags with the
+// batch-just-refreshed bit unset.
+func (s SeekGEFlags) DisableBatchJustRefreshed() SeekGEFlags {
+	return s &^ (1 << seekGEFlagBatchJustRefreshed)
+}
+
+// SeekLTFlags holds flags that may configure the behavior of a reverse seek.
+// Not all flags are relevant to all iterators.
+type SeekLTFlags uint8
+
+const (
+	seekLTFlagRelativeSeek uint8 = iota
+)
+
+// SeekLTFlagsNone is the default value of SeekLTFlags, with all flags disabled.
+const SeekLTFlagsNone = SeekLTFlags(0)
+
+// RelativeSeek is set when in the course of a reverse positioning operation, a
+// higher-level iterator seeks a lower-level iterator to a smaller key than the
+// one at the current iterator position.
+//
+// Concretely, this occurs when the merging iterator observes a range deletion
+// covering the key at a level's current position, and the merging iterator
+// seeks the level to the range deletion's start key. During lazy-combined
+// iteration, this flag signals to the level iterator that the seek is NOT an
+// absolute-positioning operation from the perspective of the pebble.Iterator,
+// and the level iterator must look for range keys in tables between the current
+// iterator position and the new seeked position.
+func (s SeekLTFlags) RelativeSeek() bool { return s&(1<<seekLTFlagRelativeSeek) != 0 }
+
+// EnableRelativeSeek returns the provided flags with the relative-seek flag
+// enabled. See RelativeSeek for an explanation of this flag's use.
+func (s SeekLTFlags) EnableRelativeSeek() SeekLTFlags {
+	return s | (1 << seekLTFlagRelativeSeek)
+}
+
+// DisableRelativeSeek returns the provided flags with the relative-seek flag
+// disabled.
+func (s SeekLTFlags) DisableRelativeSeek() SeekLTFlags {
+	return s &^ (1 << seekLTFlagRelativeSeek)
+}
+
+// InternalIteratorStats contains miscellaneous stats produced by
+// InternalIterators that are part of the InternalIterator tree. Not every
+// field is relevant for an InternalIterator implementation. The field values
+// are aggregated as one goes up the InternalIterator tree.
+type InternalIteratorStats struct {
+	// Bytes in the loaded blocks. If the block was compressed, this is the
+	// compressed bytes. Currently, only the index blocks, data blocks
+	// containing points, and filter blocks are included.
+	BlockBytes uint64
+	// Subset of BlockBytes that were in the block cache.
+	BlockBytesInCache uint64
+
+	// The following can repeatedly count the same points if they are iterated
+	// over multiple times. Additionally, they may count a point twice when
+	// switching directions. The latter could be improved if needed.
+
+	// Bytes in keys that were iterated over. Currently, only point keys are
+	// included.
+	KeyBytes uint64
+	// Bytes in values that were iterated over. Currently, only point values are
+	// included.
+	ValueBytes uint64
+	// The count of points iterated over.
+	PointCount uint64
+	// Points that were iterated over that were covered by range tombstones. It
+	// can be useful for discovering instances of
+	// https://github.com/cockroachdb/pebble/issues/1070.
+	PointsCoveredByRangeTombstones uint64
+}
+
+// Merge merges the stats in from into the given stats.
+func (s *InternalIteratorStats) Merge(from InternalIteratorStats) {
+	s.BlockBytes += from.BlockBytes
+	s.BlockBytesInCache += from.BlockBytesInCache
+	s.KeyBytes += from.KeyBytes
+	s.ValueBytes += from.ValueBytes
+	s.PointCount += from.PointCount
+	s.PointsCoveredByRangeTombstones += from.PointsCoveredByRangeTombstones
 }

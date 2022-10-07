@@ -7,13 +7,18 @@ package pebble
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
+
+	"github.com/cockroachdb/pebble/internal/keyspan"
 )
 
 // flushable defines the interface for immutable memtables.
 type flushable interface {
 	newIter(o *IterOptions) internalIterator
 	newFlushIter(o *IterOptions, bytesFlushed *uint64) internalIterator
-	newRangeDelIter(o *IterOptions) internalIterator
+	newRangeDelIter(o *IterOptions) keyspan.FragmentIterator
+	newRangeKeyIter(o *IterOptions) keyspan.FragmentIterator
+	containsRangeKeys() bool
 	// inuseBytes returns the number of inuse bytes by the flushable.
 	inuseBytes() uint64
 	// totalBytes returns the total number of bytes allocated by the flushable.
@@ -33,9 +38,10 @@ type flushableEntry struct {
 	// flushForced indicates whether a flush was forced on this memtable (either
 	// manual, or due to ingestion). Protected by DB.mu.
 	flushForced bool
-	// delayedFlushForced indicates whether a timer has been set to force a flush
-	// on this memtable at some point in the future. Protected by DB.mu
-	delayedFlushForced bool
+	// delayedFlushForcedAt indicates whether a timer has been set to force a
+	// flush on this memtable at some point in the future. Protected by DB.mu.
+	// Holds the timestamp of when the flush will be issued.
+	delayedFlushForcedAt time.Time
 	// logNum corresponds to the WAL that contains the records present in the
 	// receiver.
 	logNum FileNum

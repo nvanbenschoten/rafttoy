@@ -34,15 +34,17 @@ func (it *flushIterator) String() string {
 	return "memtable"
 }
 
-func (it *flushIterator) SeekGE(key []byte) (*base.InternalKey, []byte) {
+func (it *flushIterator) SeekGE(key []byte, flags base.SeekGEFlags) (*base.InternalKey, []byte) {
 	panic("pebble: SeekGE unimplemented")
 }
 
-func (it *flushIterator) SeekPrefixGE(prefix, key []byte) (*base.InternalKey, []byte) {
+func (it *flushIterator) SeekPrefixGE(
+	prefix, key []byte, flags base.SeekGEFlags,
+) (*base.InternalKey, []byte) {
 	panic("pebble: SeekPrefixGE unimplemented")
 }
 
-func (it *flushIterator) SeekLT(key []byte) (*base.InternalKey, []byte) {
+func (it *flushIterator) SeekLT(key []byte, flags base.SeekLTFlags) (*base.InternalKey, []byte) {
 	panic("pebble: SeekLT unimplemented")
 }
 

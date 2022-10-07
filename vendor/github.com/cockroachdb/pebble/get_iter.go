@@ -8,8 +8,8 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/rangedel"
 )
 
 // getIter is an internal iterator used to perform gets. It iterates through
@@ -24,8 +24,8 @@ type getIter struct {
 	snapshot     uint64
 	key          []byte
 	iter         internalIterator
-	rangeDelIter internalIterator
-	tombstone    rangedel.Tombstone
+	rangeDelIter keyspan.FragmentIterator
+	tombstone    *keyspan.Span
 	levelIter    levelIter
 	level        int
 	batch        *Batch
@@ -37,6 +37,9 @@ type getIter struct {
 	err          error
 }
 
+// TODO(sumeer): CockroachDB code doesn't use getIter, but, for completeness,
+// make this implement InternalIteratorWithStats.
+
 // getIter implements the base.InternalIterator interface.
 var _ base.InternalIterator = (*getIter)(nil)
 
@@ -44,15 +47,17 @@ func (g *getIter) String() string {
 	return fmt.Sprintf("len(l0)=%d, len(mem)=%d, level=%d", len(g.l0), len(g.mem), g.level)
 }
 
-func (g *getIter) SeekGE(key []byte) (*InternalKey, []byte) {
+func (g *getIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, []byte) {
 	panic("pebble: SeekGE unimplemented")
 }
 
-func (g *getIter) SeekPrefixGE(prefix, key []byte) (*InternalKey, []byte) {
+func (g *getIter) SeekPrefixGE(
+	prefix, key []byte, flags base.SeekGEFlags,
+) (*base.InternalKey, []byte) {
 	panic("pebble: SeekPrefixGE unimplemented")
 }
 
-func (g *getIter) SeekLT(key []byte) (*InternalKey, []byte) {
+func (g *getIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, []byte) {
 	panic("pebble: SeekLT unimplemented")
 }
 
@@ -77,7 +82,7 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 			// key. Every call to levelIter.Next() potentially switches to a new
 			// table and thus reinitializes rangeDelIter.
 			if g.rangeDelIter != nil {
-				g.tombstone = rangedel.Get(g.cmp, g.rangeDelIter, g.key, g.snapshot)
+				g.tombstone = keyspan.Get(g.cmp, g.rangeDelIter, g.key)
 				if g.err = g.rangeDelIter.Close(); g.err != nil {
 					return nil, nil
 				}
@@ -86,7 +91,7 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 
 			if g.iterKey != nil {
 				key := g.iterKey
-				if g.tombstone.Deletes(key.SeqNum()) {
+				if g.tombstone != nil && g.tombstone.CoversAt(g.snapshot, key.SeqNum()) {
 					// We have a range tombstone covering this key. Rather than return a
 					// point or range deletion here, we return false and close our
 					// internal iterator which will make Valid() return false,
@@ -96,7 +101,7 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 					return nil, nil
 				}
 				if g.equal(g.key, key.UserKey) {
-					if !key.Visible(g.snapshot) {
+					if !key.Visible(g.snapshot, base.InternalKeySeqNumMax) {
 						g.iterKey, g.iterValue = g.iter.Next()
 						continue
 					}
@@ -114,16 +119,26 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 
 		// Create an iterator from the batch.
 		if g.batch != nil {
+			if g.batch.index == nil {
+				g.err = ErrNotIndexed
+				g.iterKey, g.iterValue = nil, nil
+				return nil, nil
+			}
 			g.iter = g.batch.newInternalIter(nil)
-			g.rangeDelIter = g.batch.newRangeDelIter(nil)
+			g.rangeDelIter = g.batch.newRangeDelIter(
+				nil,
+				// Get always reads the entirety of the batch's history, so no
+				// batch keys should be filtered.
+				base.InternalKeySeqNumMax,
+			)
+			g.iterKey, g.iterValue = g.iter.SeekGE(g.key, base.SeekGEFlagsNone)
 			g.batch = nil
-			g.iterKey, g.iterValue = g.iter.SeekGE(g.key)
 			continue
 		}
 
 		// If we have a tombstone from a previous level it is guaranteed to delete
 		// keys in lower levels.
-		if !g.tombstone.Empty() {
+		if g.tombstone != nil && g.tombstone.VisibleAt(g.snapshot) {
 			return nil, nil
 		}
 
@@ -133,7 +148,7 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 			g.iter = m.newIter(nil)
 			g.rangeDelIter = m.newRangeDelIter(nil)
 			g.mem = g.mem[:n-1]
-			g.iterKey, g.iterValue = g.iter.SeekGE(g.key)
+			g.iterKey, g.iterValue = g.iter.SeekGE(g.key, base.SeekGEFlagsNone)
 			continue
 		}
 
@@ -143,10 +158,11 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 				files := g.l0[n-1].Iter()
 				g.l0 = g.l0[:n-1]
 				iterOpts := IterOptions{logger: g.logger}
-				g.levelIter.init(iterOpts, g.cmp, g.newIters, files, manifest.L0Sublevel(n), nil)
+				g.levelIter.init(iterOpts, g.cmp, nil /* split */, g.newIters,
+					files, manifest.L0Sublevel(n), internalIterOpts{})
 				g.levelIter.initRangeDel(&g.rangeDelIter)
 				g.iter = &g.levelIter
-				g.iterKey, g.iterValue = g.iter.SeekGE(g.key)
+				g.iterKey, g.iterValue = g.iter.SeekGE(g.key, base.SeekGEFlagsNone)
 				continue
 			}
 			g.level++
@@ -161,12 +177,12 @@ func (g *getIter) Next() (*InternalKey, []byte) {
 		}
 
 		iterOpts := IterOptions{logger: g.logger}
-		g.levelIter.init(iterOpts, g.cmp, g.newIters,
-			g.version.Levels[g.level].Iter(), manifest.Level(g.level), nil)
+		g.levelIter.init(iterOpts, g.cmp, nil /* split */, g.newIters,
+			g.version.Levels[g.level].Iter(), manifest.Level(g.level), internalIterOpts{})
 		g.levelIter.initRangeDel(&g.rangeDelIter)
 		g.level++
 		g.iter = &g.levelIter
-		g.iterKey, g.iterValue = g.iter.SeekGE(g.key)
+		g.iterKey, g.iterValue = g.iter.SeekGE(g.key, base.SeekGEFlagsNone)
 	}
 }
 

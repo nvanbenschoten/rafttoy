@@ -8,11 +8,15 @@ import (
 	"bytes"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/vfs"
 )
 
@@ -40,13 +44,12 @@ type TableInfo struct {
 
 // TableStats contains statistics on a table used for compaction heuristics.
 type TableStats struct {
-	// Valid true if stats have been loaded for the table. The rest of the
-	// structure is populated only if true.
-	Valid bool
 	// The total number of entries in the table.
 	NumEntries uint64
 	// The number of point and range deletion entries in the table.
 	NumDeletions uint64
+	// NumRangeKeySets is the total number of range key sets in the table.
+	NumRangeKeySets uint64
 	// Estimate of the total disk space that may be dropped by this table's
 	// point deletions by compacting them.
 	PointDeletionsBytesEstimate uint64
@@ -63,8 +66,80 @@ type TableStats struct {
 	RangeDeletionsBytesEstimate uint64
 }
 
+// boundType represents the type of key (point or range) present as the smallest
+// and largest keys.
+type boundType uint8
+
+const (
+	boundTypePointKey boundType = iota + 1
+	boundTypeRangeKey
+)
+
+// CompactionState is the compaction state of a file.
+//
+// The following shows the valid state transitions:
+//
+//    NotCompacting --> Compacting --> Compacted
+//          ^               |
+//          |               |
+//          +-------<-------+
+//
+// Input files to a compaction transition to Compacting when a compaction is
+// picked. A file that has finished compacting typically transitions into the
+// Compacted state, at which point it is effectively obsolete ("zombied") and
+// will eventually be removed from the LSM. A file that has been move-compacted
+// will transition from Compacting back into the NotCompacting state, signaling
+// that the file may be selected for a subsequent compaction. A failed
+// compaction will result in all input tables transitioning from Compacting to
+// NotCompacting.
+//
+// This state is in-memory only. It is not persisted to the manifest.
+type CompactionState uint8
+
+// CompactionStates.
+const (
+	CompactionStateNotCompacting CompactionState = iota
+	CompactionStateCompacting
+	CompactionStateCompacted
+)
+
+// String implements fmt.Stringer.
+func (s CompactionState) String() string {
+	switch s {
+	case CompactionStateNotCompacting:
+		return "NotCompacting"
+	case CompactionStateCompacting:
+		return "Compacting"
+	case CompactionStateCompacted:
+		return "Compacted"
+	default:
+		panic(fmt.Sprintf("pebble: unknown compaction state %d", s))
+	}
+}
+
 // FileMetadata holds the metadata for an on-disk table.
 type FileMetadata struct {
+	// Atomic contains fields which are accessed atomically. Go allocations
+	// are guaranteed to be 64-bit aligned which we take advantage of by
+	// placing the 64-bit fields which we access atomically at the beginning
+	// of the FileMetadata struct. For more information, see
+	// https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
+	Atomic struct {
+		// AllowedSeeks is used to determine if a file should be picked for
+		// a read triggered compaction. It is decremented when read sampling
+		// in pebble.Iterator after every after every positioning operation
+		// that returns a user key (eg. Next, Prev, SeekGE, SeekLT, etc).
+		AllowedSeeks int64
+
+		// statsValid is 1 if stats have been loaded for the table. The
+		// TableStats structure is populated only if valid is 1.
+		statsValid uint32
+	}
+
+	// InitAllowedSeeks is the inital value of allowed seeks. This is used
+	// to re-set allowed seeks on a file once it hits 0.
+	InitAllowedSeeks int64
+
 	// Reference count for the file: incremented when a file is added to a
 	// version and decremented when the version is unreferenced. The file is
 	// obsolete when the reference count falls to zero.
@@ -77,51 +152,326 @@ type FileMetadata struct {
 	// UTC). For ingested sstables, this corresponds to the time the file was
 	// ingested.
 	CreationTime int64
-	// Smallest and Largest are the inclusive bounds for the internal keys
-	// stored in the table.
-	Smallest InternalKey
-	Largest  InternalKey
-	// Smallest and largest sequence numbers in the table.
+	// Smallest and largest sequence numbers in the table, across both point and
+	// range keys.
 	SmallestSeqNum uint64
 	LargestSeqNum  uint64
-	// True if the file is actively being compacted. Protected by DB.mu.
-	Compacting bool
+	// SmallestPointKey and LargestPointKey are the inclusive bounds for the
+	// internal point keys stored in the table. This includes RANGEDELs, which
+	// alter point keys.
+	// NB: these field should be set using ExtendPointKeyBounds. They are left
+	// exported for reads as an optimization.
+	SmallestPointKey InternalKey
+	LargestPointKey  InternalKey
+	// SmallestRangeKey and LargestRangeKey are the inclusive bounds for the
+	// internal range keys stored in the table.
+	// NB: these field should be set using ExtendRangeKeyBounds. They are left
+	// exported for reads as an optimization.
+	SmallestRangeKey InternalKey
+	LargestRangeKey  InternalKey
+	// Smallest and Largest are the inclusive bounds for the internal keys stored
+	// in the table, across both point and range keys.
+	// NB: these fields are derived from their point and range key equivalents,
+	// and are updated via the MaybeExtend{Point,Range}KeyBounds methods.
+	Smallest InternalKey
+	Largest  InternalKey
 	// Stats describe table statistics. Protected by DB.mu.
 	Stats TableStats
-	// For L0 files only. Protected by DB.mu. Used to generate L0 sublevels and
-	// pick L0 compactions.
-	//
-	// IsIntraL0Compacting is set to True if this file is part of an intra-L0
-	// compaction. When it's true, Compacting must also be true. If Compacting
-	// is true and IsIntraL0Compacting is false for an L0 file, the file must
-	// be part of a compaction to Lbase.
-	IsIntraL0Compacting bool
-	// Fields inside the Atomic struct should be accessed atomically.
-	Atomic struct {
-		// AllowedSeeks is used to determine if a file should be picked for
-		// a read triggered compaction. It is decremented when read sampling
-		// in pebble.Iterator after every after every positioning operation
-		// that returns a user key (eg. Next, Prev, SeekGE, SeekLT, etc).
-		AllowedSeeks int64
-	}
-	subLevel         int
-	l0Index          int
+
+	SubLevel         int
+	L0Index          int
 	minIntervalIndex int
 	maxIntervalIndex int
 
-	// True if user asked us to compact this file. This flag is only set and
-	// respected by RocksDB but exists here to preserve its value in the
-	// MANIFEST.
-	markedForCompaction bool
+	// NB: the alignment of this struct is 8 bytes. We pack all the bools to
+	// ensure an optimal packing.
+
+	// For L0 files only. Protected by DB.mu. Used to generate L0 sublevels and
+	// pick L0 compactions. Only accurate for the most recent Version.
+	//
+	// IsIntraL0Compacting is set to True if this file is part of an intra-L0
+	// compaction. When it's true, IsCompacting must also return true. If
+	// Compacting is true and IsIntraL0Compacting is false for an L0 file, the
+	// file must be part of a compaction to Lbase.
+	IsIntraL0Compacting bool
+	CompactionState     CompactionState
+	// True if compaction of this file has been explicitly requested.
+	// Previously, RocksDB and earlier versions of Pebble allowed this
+	// flag to be set by a user table property collector. Some earlier
+	// versions of Pebble respected this flag, while other more recent
+	// versions ignored this flag.
+	//
+	// More recently this flag has been repurposed to facilitate the
+	// compaction of 'atomic compaction units'. Files marked for
+	// compaction are compacted in a rewrite compaction at the lowest
+	// possible compaction priority.
+	//
+	// NB: A count of files marked for compaction is maintained on
+	// Version, and compaction picking reads cached annotations
+	// determined by this field.
+	//
+	// Protected by DB.mu.
+	MarkedForCompaction bool
+	// HasPointKeys tracks whether the table contains point keys (including
+	// RANGEDELs). If a table contains only range deletions, HasPointsKeys is
+	// still true.
+	HasPointKeys bool
+	// HasRangeKeys tracks whether the table contains any range keys.
+	HasRangeKeys bool
+	// smallestSet and largestSet track whether the overall bounds have been set.
+	boundsSet bool
+	// boundTypeSmallest and boundTypeLargest provide an indication as to which
+	// key type (point or range) corresponds to the smallest and largest overall
+	// table bounds.
+	boundTypeSmallest, boundTypeLargest boundType
 }
 
+// SetCompactionState transitions this file's compaction state to the given
+// state. Protected by DB.mu.
+func (m *FileMetadata) SetCompactionState(to CompactionState) {
+	if invariants.Enabled {
+		transitionErr := func() error {
+			return errors.Newf("pebble: invalid compaction state transition: %s -> %s", m.CompactionState, to)
+		}
+		switch m.CompactionState {
+		case CompactionStateNotCompacting:
+			if to != CompactionStateCompacting {
+				panic(transitionErr())
+			}
+		case CompactionStateCompacting:
+			if to != CompactionStateCompacted && to != CompactionStateNotCompacting {
+				panic(transitionErr())
+			}
+		case CompactionStateCompacted:
+			panic(transitionErr())
+		default:
+			panic(fmt.Sprintf("pebble: unknown compaction state: %d", m.CompactionState))
+		}
+	}
+	m.CompactionState = to
+}
+
+// IsCompacting returns true if this file's compaction state is
+// CompactionStateCompacting. Protected by DB.mu.
+func (m *FileMetadata) IsCompacting() bool {
+	return m.CompactionState == CompactionStateCompacting
+}
+
+// StatsValid returns true if the table stats have been populated. If StatValid
+// returns true, the Stats field may be read (with or without holding the
+// database mutex).
+func (m *FileMetadata) StatsValid() bool {
+	return atomic.LoadUint32(&m.Atomic.statsValid) == 1
+}
+
+// StatsValidLocked returns true if the table stats have been populated.
+// StatsValidLocked requires DB.mu is held when it's invoked, and it avoids the
+// overhead of an atomic load. This is possible because table stats validity is
+// only set while DB.mu is held.
+func (m *FileMetadata) StatsValidLocked() bool {
+	return m.Atomic.statsValid == 1
+}
+
+// StatsMarkValid marks the TableStats as valid. The caller must hold DB.mu
+// while populating TableStats and calling StatsMarkValud. Once stats are
+// populated, they must not be mutated.
+func (m *FileMetadata) StatsMarkValid() {
+	atomic.StoreUint32(&m.Atomic.statsValid, 1)
+}
+
+// ExtendPointKeyBounds attempts to extend the lower and upper point key bounds
+// and overall table bounds with the given smallest and largest keys. The
+// smallest and largest bounds may not be extended if the table already has a
+// bound that is smaller or larger, respectively. The receiver is returned.
+// NB: calling this method should be preferred to manually setting the bounds by
+// manipulating the fields directly, to maintain certain invariants.
+func (m *FileMetadata) ExtendPointKeyBounds(
+	cmp Compare, smallest, largest InternalKey,
+) *FileMetadata {
+	// Update the point key bounds.
+	if !m.HasPointKeys {
+		m.SmallestPointKey, m.LargestPointKey = smallest, largest
+		m.HasPointKeys = true
+	} else {
+		if base.InternalCompare(cmp, smallest, m.SmallestPointKey) < 0 {
+			m.SmallestPointKey = smallest
+		}
+		if base.InternalCompare(cmp, largest, m.LargestPointKey) > 0 {
+			m.LargestPointKey = largest
+		}
+	}
+	// Update the overall bounds.
+	m.extendOverallBounds(cmp, m.SmallestPointKey, m.LargestPointKey, boundTypePointKey)
+	return m
+}
+
+// ExtendRangeKeyBounds attempts to extend the lower and upper range key bounds
+// and overall table bounds with the given smallest and largest keys. The
+// smallest and largest bounds may not be extended if the table already has a
+// bound that is smaller or larger, respectively. The receiver is returned.
+// NB: calling this method should be preferred to manually setting the bounds by
+// manipulating the fields directly, to maintain certain invariants.
+func (m *FileMetadata) ExtendRangeKeyBounds(
+	cmp Compare, smallest, largest InternalKey,
+) *FileMetadata {
+	// Update the range key bounds.
+	if !m.HasRangeKeys {
+		m.SmallestRangeKey, m.LargestRangeKey = smallest, largest
+		m.HasRangeKeys = true
+	} else {
+		if base.InternalCompare(cmp, smallest, m.SmallestRangeKey) < 0 {
+			m.SmallestRangeKey = smallest
+		}
+		if base.InternalCompare(cmp, largest, m.LargestRangeKey) > 0 {
+			m.LargestRangeKey = largest
+		}
+	}
+	// Update the overall bounds.
+	m.extendOverallBounds(cmp, m.SmallestRangeKey, m.LargestRangeKey, boundTypeRangeKey)
+	return m
+}
+
+// extendOverallBounds attempts to extend the overall table lower and upper
+// bounds. The given bounds may not be used if a lower or upper bound already
+// exists that is smaller or larger than the given keys, respectively. The given
+// boundType will be used if the bounds are updated.
+func (m *FileMetadata) extendOverallBounds(
+	cmp Compare, smallest, largest InternalKey, bTyp boundType,
+) {
+	if !m.boundsSet {
+		m.Smallest, m.Largest = smallest, largest
+		m.boundsSet = true
+		m.boundTypeSmallest, m.boundTypeLargest = bTyp, bTyp
+	} else {
+		if base.InternalCompare(cmp, smallest, m.Smallest) < 0 {
+			m.Smallest = smallest
+			m.boundTypeSmallest = bTyp
+		}
+		if base.InternalCompare(cmp, largest, m.Largest) > 0 {
+			m.Largest = largest
+			m.boundTypeLargest = bTyp
+		}
+	}
+}
+
+const (
+	maskContainsPointKeys = 1 << 0
+	maskSmallest          = 1 << 1
+	maskLargest           = 1 << 2
+)
+
+// boundsMarker returns a marker byte whose bits encode the following
+// information (in order from least significant bit):
+// - if the table contains point keys
+// - if the table's smallest key is a point key
+// - if the table's largest key is a point key
+func (m *FileMetadata) boundsMarker() (sentinel uint8, err error) {
+	if m.HasPointKeys {
+		sentinel |= maskContainsPointKeys
+	}
+	switch m.boundTypeSmallest {
+	case boundTypePointKey:
+		sentinel |= maskSmallest
+	case boundTypeRangeKey:
+		// No op - leave bit unset.
+	default:
+		return 0, base.CorruptionErrorf("file %s has neither point nor range key as smallest key", m.FileNum)
+	}
+	switch m.boundTypeLargest {
+	case boundTypePointKey:
+		sentinel |= maskLargest
+	case boundTypeRangeKey:
+		// No op - leave bit unset.
+	default:
+		return 0, base.CorruptionErrorf("file %s has neither point nor range key as largest key", m.FileNum)
+	}
+	return
+}
+
+// String implements fmt.Stringer, printing the file number and the overall
+// table bounds.
 func (m *FileMetadata) String() string {
-	return fmt.Sprintf("%s:%s-%s", m.FileNum, m.Smallest, m.Largest)
+	return fmt.Sprintf("%s:[%s-%s]", m.FileNum, m.Smallest, m.Largest)
+}
+
+// DebugString returns a verbose representation of FileMetadata, typically for
+// use in tests and debugging, returning the file number and the point, range
+// and overall bounds for the table.
+func (m *FileMetadata) DebugString(format base.FormatKey, verbose bool) string {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "%s:[%s-%s]",
+		m.FileNum, m.Smallest.Pretty(format), m.Largest.Pretty(format))
+	if !verbose {
+		return b.String()
+	}
+	if m.HasPointKeys {
+		fmt.Fprintf(&b, " points:[%s-%s]",
+			m.SmallestPointKey.Pretty(format), m.LargestPointKey.Pretty(format))
+	}
+	if m.HasRangeKeys {
+		fmt.Fprintf(&b, " ranges:[%s-%s]",
+			m.SmallestRangeKey.Pretty(format), m.LargestRangeKey.Pretty(format))
+	}
+	return b.String()
+}
+
+// ParseFileMetadataDebug parses a FileMetadata from its DebugString
+// representation.
+func ParseFileMetadataDebug(s string) (m FileMetadata, err error) {
+	// Split lines of the form:
+	//  000000:[a#0,SET-z#0,SET] points:[...] ranges:[...]
+	fields := strings.FieldsFunc(s, func(c rune) bool {
+		switch c {
+		case ':', '[', '-', ']':
+			return true
+		default:
+			return unicode.IsSpace(c) // NB: also trim whitespace padding.
+		}
+	})
+	if len(fields)%3 != 0 {
+		return m, errors.Newf("malformed input: %s", s)
+	}
+	for len(fields) > 0 {
+		prefix := fields[0]
+		smallest := base.ParsePrettyInternalKey(fields[1])
+		largest := base.ParsePrettyInternalKey(fields[2])
+		switch prefix {
+		case "points":
+			m.SmallestPointKey, m.LargestPointKey = smallest, largest
+			m.HasPointKeys = true
+		case "ranges":
+			m.SmallestRangeKey, m.LargestRangeKey = smallest, largest
+			m.HasRangeKeys = true
+		default:
+			fileNum, err := strconv.ParseUint(prefix, 10, 64)
+			if err != nil {
+				return m, errors.Newf("malformed input: %s: %s", s, err)
+			}
+			m.FileNum = base.FileNum(fileNum)
+			m.Smallest, m.Largest = smallest, largest
+			m.boundsSet = true
+		}
+		fields = fields[3:]
+	}
+	// By default, when the parser sees just the overall bounds, we set the point
+	// keys. This preserves backwards compatability with existing test cases that
+	// specify only the overall bounds.
+	if !m.HasPointKeys && !m.HasRangeKeys {
+		m.SmallestPointKey, m.LargestPointKey = m.Smallest, m.Largest
+		m.HasPointKeys = true
+	}
+	return
 }
 
 // Validate validates the metadata for consistency with itself, returning an
 // error if inconsistent.
 func (m *FileMetadata) Validate(cmp Compare, formatKey base.FormatKey) error {
+	// Combined range and point key validation.
+
+	if !m.HasPointKeys && !m.HasRangeKeys {
+		return base.CorruptionErrorf("file %s has neither point nor range keys",
+			errors.Safe(m.FileNum))
+	}
 	if base.InternalCompare(cmp, m.Smallest, m.Largest) > 0 {
 		return base.CorruptionErrorf("file %s has inconsistent bounds: %s vs %s",
 			errors.Safe(m.FileNum), m.Smallest.Pretty(formatKey),
@@ -131,6 +481,47 @@ func (m *FileMetadata) Validate(cmp Compare, formatKey base.FormatKey) error {
 		return base.CorruptionErrorf("file %s has inconsistent seqnum bounds: %d vs %d",
 			errors.Safe(m.FileNum), m.SmallestSeqNum, m.LargestSeqNum)
 	}
+
+	// Point key validation.
+
+	if m.HasPointKeys {
+		if base.InternalCompare(cmp, m.SmallestPointKey, m.LargestPointKey) > 0 {
+			return base.CorruptionErrorf("file %s has inconsistent point key bounds: %s vs %s",
+				errors.Safe(m.FileNum), m.SmallestPointKey.Pretty(formatKey),
+				m.LargestPointKey.Pretty(formatKey))
+		}
+		if base.InternalCompare(cmp, m.SmallestPointKey, m.Smallest) < 0 ||
+			base.InternalCompare(cmp, m.LargestPointKey, m.Largest) > 0 {
+			return base.CorruptionErrorf(
+				"file %s has inconsistent point key bounds relative to overall bounds: "+
+					"overall = [%s-%s], point keys = [%s-%s]",
+				errors.Safe(m.FileNum),
+				m.Smallest.Pretty(formatKey), m.Largest.Pretty(formatKey),
+				m.SmallestPointKey.Pretty(formatKey), m.LargestPointKey.Pretty(formatKey),
+			)
+		}
+	}
+
+	// Range key validation.
+
+	if m.HasRangeKeys {
+		if base.InternalCompare(cmp, m.SmallestRangeKey, m.LargestRangeKey) > 0 {
+			return base.CorruptionErrorf("file %s has inconsistent range key bounds: %s vs %s",
+				errors.Safe(m.FileNum), m.SmallestRangeKey.Pretty(formatKey),
+				m.LargestRangeKey.Pretty(formatKey))
+		}
+		if base.InternalCompare(cmp, m.SmallestRangeKey, m.Smallest) < 0 ||
+			base.InternalCompare(cmp, m.LargestRangeKey, m.Largest) > 0 {
+			return base.CorruptionErrorf(
+				"file %s has inconsistent range key bounds relative to overall bounds: "+
+					"overall = [%s-%s], range keys = [%s-%s]",
+				errors.Safe(m.FileNum),
+				m.Smallest.Pretty(formatKey), m.Largest.Pretty(formatKey),
+				m.SmallestRangeKey.Pretty(formatKey), m.LargestRangeKey.Pretty(formatKey),
+			)
+		}
+	}
+
 	return nil
 }
 
@@ -233,22 +624,44 @@ func SortBySmallest(files []*FileMetadata, cmp Compare) {
 	sort.Sort(bySmallest{files, cmp})
 }
 
-func overlaps(iter LevelIterator, cmp Compare, start, end []byte) LevelSlice {
+func overlaps(iter LevelIterator, cmp Compare, start, end []byte, exclusiveEnd bool) LevelSlice {
 	startIter := iter.Clone()
 	startIter.SeekGE(cmp, start)
+
+	// SeekGE compares user keys. The user key `start` may be equal to the
+	// f.Largest because f.Largest is a range deletion sentinel, indicating that
+	// the user key `start` is NOT contained within the file f. If that's the
+	// case, we can narrow the overlapping bounds to exclude the file with the
+	// sentinel.
+	if f := startIter.Current(); f != nil && f.Largest.IsExclusiveSentinel() &&
+		cmp(f.Largest.UserKey, start) == 0 {
+		startIter.Next()
+	}
 
 	endIter := iter.Clone()
 	endIter.SeekGE(cmp, end)
 
-	// endIter is now pointing at the *first* file with a largest key >= end.
-	// If there are multiple files including the user key `end`, we want all
-	// of them, so move forward.
-	for endIter.Current() != nil && cmp(endIter.Current().Largest.UserKey, end) == 0 {
-		endIter.Next()
+	if !exclusiveEnd {
+		// endIter is now pointing at the *first* file with a largest key >= end.
+		// If there are multiple files including the user key `end`, we want all
+		// of them, so move forward.
+		for f := endIter.Current(); f != nil && cmp(f.Largest.UserKey, end) == 0; {
+			f = endIter.Next()
+		}
 	}
+
 	// LevelSlice uses inclusive bounds, so if we seeked to the end sentinel
 	// or nexted too far because Largest.UserKey equaled `end`, go back.
-	if !endIter.iter.valid() || cmp(endIter.Current().Smallest.UserKey, end) > 0 {
+	//
+	// Consider !exclusiveEnd and end = 'f', with the following file bounds:
+	//
+	//     [b,d] [e, f] [f, f] [g, h]
+	//
+	// the above for loop will Next until it arrives at [g, h]. We need to
+	// observe that g > f, and Prev to the file with bounds [f, f].
+	if !endIter.iter.valid() {
+		endIter.Prev()
+	} else if c := cmp(endIter.Current().Smallest.UserKey, end); c > 0 || c == 0 && exclusiveEnd {
 		endIter.Prev()
 	}
 
@@ -274,8 +687,9 @@ func NewVersion(
 		// they appear within `files`. Some tests depend on this behavior in
 		// order to test consistency checking, etc. Once we've constructed the
 		// initial B-Tree, we swap out the btreeCmp for the correct one.
+		// TODO(jackson): Adjust or remove the tests and remove this.
 		v.Levels[l].tree, _ = makeBTree(btreeCmpSpecificOrder(files[l]), files[l])
-
+		v.Levels[l].level = l
 		if l == 0 {
 			v.Levels[l].tree.cmp = btreeCmpSeqNum
 		} else {
@@ -323,15 +737,37 @@ type Version struct {
 	// levels, sublevel n contains older tables (lower sequence numbers) than
 	// sublevel n+1.
 	//
+	// The L0Sublevels struct is mostly used for compaction picking. As most
+	// internal data structures in it are only necessary for compaction picking
+	// and not for iterator creation, the reference to L0Sublevels is nil'd
+	// after this version becomes the non-newest version, to reduce memory
+	// usage.
+	//
 	// L0Sublevels.Levels contains L0 files ordered by sublevels. All the files
-	// in Files[0] are in L0Sublevels.Levels.
-	L0Sublevels *L0Sublevels
+	// in Files[0] are in L0Sublevels.Levels. L0SublevelFiles is also set to
+	// a reference to that slice, as that slice is necessary for iterator
+	// creation and needs to outlast L0Sublevels.
+	L0Sublevels     *L0Sublevels
+	L0SublevelFiles []LevelSlice
 
 	Levels [NumLevels]LevelMetadata
+
+	// RangeKeyLevels holds a subset of the same files as Levels that contain range
+	// keys (i.e. fileMeta.HasRangeKeys == true). The memory amplification of this
+	// duplication should be minimal, as range keys are expected to be rare.
+	RangeKeyLevels [NumLevels]LevelMetadata
 
 	// The callback to invoke when the last reference to a version is
 	// removed. Will be called with list.mu held.
 	Deleted func(obsolete []*FileMetadata)
+
+	// Stats holds aggregated stats about the version maintained from
+	// version to version.
+	Stats struct {
+		// MarkedForCompaction records the count of files marked for
+		// compaction within the version.
+		MarkedForCompaction int
+	}
 
 	// The list the version is linked into.
 	list *VersionList
@@ -340,47 +776,25 @@ type Version struct {
 	prev, next *Version
 }
 
+// String implements fmt.Stringer, printing the FileMetadata for each level in
+// the Version.
 func (v *Version) String() string {
-	return v.Pretty(base.DefaultFormatter)
+	return v.string(base.DefaultFormatter, false)
 }
 
-// Pretty returns a string representation of the version.
-func (v *Version) Pretty(format base.FormatKey) string {
-	var buf bytes.Buffer
-	if v.L0Sublevels != nil {
-		for sublevel := len(v.L0Sublevels.Levels) - 1; sublevel >= 0; sublevel-- {
-			fmt.Fprintf(&buf, "0.%d:\n", sublevel)
-			v.L0Sublevels.Levels[sublevel].Each(func(f *FileMetadata) {
-				fmt.Fprintf(&buf, "  %06d:[%s-%s]\n", f.FileNum,
-					format(f.Smallest.UserKey), format(f.Largest.UserKey))
-			})
-		}
-	}
-	for level := 1; level < NumLevels; level++ {
-		if v.Levels[level].Empty() {
-			continue
-		}
-		fmt.Fprintf(&buf, "%d:\n", level)
-		iter := v.Levels[level].Iter()
-		for f := iter.First(); f != nil; f = iter.Next() {
-			fmt.Fprintf(&buf, "  %s:[%s-%s]\n", f.FileNum,
-				format(f.Smallest.UserKey), format(f.Largest.UserKey))
-		}
-	}
-	return buf.String()
-}
-
-// DebugString returns an alternative format to String() which includes
-// sequence number and kind information for the sstable boundaries.
+// DebugString returns an alternative format to String() which includes sequence
+// number and kind information for the sstable boundaries.
 func (v *Version) DebugString(format base.FormatKey) string {
-	var buf bytes.Buffer
+	return v.string(format, true)
+}
 
-	if v.L0Sublevels != nil {
-		for sublevel := len(v.L0Sublevels.Levels) - 1; sublevel >= 0; sublevel-- {
+func (v *Version) string(format base.FormatKey, verbose bool) string {
+	var buf bytes.Buffer
+	if len(v.L0SublevelFiles) > 0 {
+		for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
 			fmt.Fprintf(&buf, "0.%d:\n", sublevel)
-			v.L0Sublevels.Levels[sublevel].Each(func(f *FileMetadata) {
-				fmt.Fprintf(&buf, "  %06d:[%s-%s]\n", f.FileNum,
-					f.Smallest.Pretty(format), f.Largest.Pretty(format))
+			v.L0SublevelFiles[sublevel].Each(func(f *FileMetadata) {
+				fmt.Fprintf(&buf, "  %s\n", f.DebugString(format, verbose))
 			})
 		}
 	}
@@ -391,11 +805,48 @@ func (v *Version) DebugString(format base.FormatKey) string {
 		fmt.Fprintf(&buf, "%d:\n", level)
 		iter := v.Levels[level].Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
-			fmt.Fprintf(&buf, "  %s:[%s-%s]\n", f.FileNum,
-				f.Smallest.Pretty(format), f.Largest.Pretty(format))
+			fmt.Fprintf(&buf, "  %s\n", f.DebugString(format, verbose))
 		}
 	}
 	return buf.String()
+}
+
+// ParseVersionDebug parses a Version from its DebugString output.
+func ParseVersionDebug(
+	cmp Compare, formatKey base.FormatKey, flushSplitBytes int64, s string,
+) (*Version, error) {
+	var level int
+	var files [NumLevels][]*FileMetadata
+	for _, l := range strings.Split(s, "\n") {
+		l = strings.TrimSpace(l)
+
+		switch l[:2] {
+		case "0.", "0:", "1:", "2:", "3:", "4:", "5:", "6:":
+			var err error
+			level, err = strconv.Atoi(l[:1])
+			if err != nil {
+				return nil, err
+			}
+		default:
+			m, err := ParseFileMetadataDebug(l)
+			if err != nil {
+				return nil, err
+			}
+			// If we only parsed overall bounds, default to setting the point bounds.
+			if !m.HasPointKeys && !m.HasRangeKeys {
+				m.SmallestPointKey, m.LargestPointKey = m.Smallest, m.Largest
+				m.HasPointKeys = true
+			}
+			files[level] = append(files[level], &m)
+		}
+	}
+	// Reverse the order of L0 files. This ensures we construct the same
+	// sublevels. (They're printed from higher sublevel to lower, which means in
+	// a partial order that represents newest to oldest).
+	for i := 0; i < len(files[0])/2; i++ {
+		files[0][i], files[0][len(files[0])-i-1] = files[0][len(files[0])-i-1], files[0][i]
+	}
+	return NewVersion(cmp, formatKey, flushSplitBytes, files), nil
 }
 
 // Refs returns the number of references to the version.
@@ -453,6 +904,9 @@ func (v *Version) InitL0Sublevels(
 ) error {
 	var err error
 	v.L0Sublevels, err = NewL0Sublevels(&v.Levels[0], cmp, formatKey, flushSplitBytes)
+	if err == nil && v.L0Sublevels != nil {
+		v.L0SublevelFiles = v.L0Sublevels.Levels
+	}
 	return err
 }
 
@@ -463,7 +917,8 @@ func (v *Version) InitL0Sublevels(
 func (v *Version) Contains(level int, cmp Compare, m *FileMetadata) bool {
 	iter := v.Levels[level].Iter()
 	if level > 0 {
-		overlaps := v.Overlaps(level, cmp, m.Smallest.UserKey, m.Largest.UserKey)
+		overlaps := v.Overlaps(level, cmp, m.Smallest.UserKey, m.Largest.UserKey,
+			m.Largest.IsExclusiveSentinel())
 		iter = overlaps.Iter()
 	}
 	for f := iter.First(); f != nil; f = iter.Next() {
@@ -482,7 +937,9 @@ func (v *Version) Contains(level int, cmp Compare, m *FileMetadata) bool {
 // and the computation is repeated until [start, end] stabilizes.
 // The returned files are a subsequence of the input files, i.e., the ordering
 // is not changed.
-func (v *Version) Overlaps(level int, cmp Compare, start, end []byte) LevelSlice {
+func (v *Version) Overlaps(
+	level int, cmp Compare, start, end []byte, exclusiveEnd bool,
+) LevelSlice {
 	if level == 0 {
 		// Indices that have been selected as overlapping.
 		l0 := v.Levels[level]
@@ -499,11 +956,11 @@ func (v *Version) Overlaps(level int, cmp Compare, start, end []byte) LevelSlice
 				}
 				smallest := meta.Smallest.UserKey
 				largest := meta.Largest.UserKey
-				if cmp(largest, start) < 0 {
+				if c := cmp(largest, start); c < 0 || c == 0 && meta.Largest.IsExclusiveSentinel() {
 					// meta is completely before the specified range; skip it.
 					continue
 				}
-				if cmp(smallest, end) > 0 {
+				if c := cmp(smallest, end); c > 0 || c == 0 && exclusiveEnd {
 					// meta is completely after the specified range; skip it.
 					continue
 				}
@@ -520,8 +977,14 @@ func (v *Version) Overlaps(level int, cmp Compare, start, end []byte) LevelSlice
 					start = smallest
 					restart = true
 				}
-				if cmp(largest, end) > 0 {
+				if v := cmp(largest, end); v > 0 {
 					end = largest
+					exclusiveEnd = meta.Largest.IsExclusiveSentinel()
+					restart = true
+				} else if v == 0 && exclusiveEnd && !meta.Largest.IsExclusiveSentinel() {
+					// Only update the exclusivity of our existing `end`
+					// bound.
+					exclusiveEnd = false
 					restart = true
 				}
 			}
@@ -550,15 +1013,15 @@ func (v *Version) Overlaps(level int, cmp Compare, start, end []byte) LevelSlice
 		return slice
 	}
 
-	return overlaps(v.Levels[level].Iter(), cmp, start, end)
+	return overlaps(v.Levels[level].Iter(), cmp, start, end, exclusiveEnd)
 }
 
 // CheckOrdering checks that the files are consistent with respect to
 // increasing file numbers (for level 0 files) and increasing and non-
 // overlapping internal key ranges (for level non-0 files).
 func (v *Version) CheckOrdering(cmp Compare, format base.FormatKey) error {
-	for sublevel := len(v.L0Sublevels.Levels) - 1; sublevel >= 0; sublevel-- {
-		sublevelIter := v.L0Sublevels.Levels[sublevel].Iter()
+	for sublevel := len(v.L0SublevelFiles) - 1; sublevel >= 0; sublevel-- {
+		sublevelIter := v.L0SublevelFiles[sublevel].Iter()
 		if err := CheckOrdering(cmp, format, L0Sublevel(sublevel), sublevelIter); err != nil {
 			return base.CorruptionErrorf("%s\n%s", err, v.DebugString(format))
 		}
@@ -581,7 +1044,7 @@ func (v *Version) CheckConsistency(dirname string, fs vfs.FS) error {
 	for level, files := range v.Levels {
 		iter := files.Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
-			path := base.MakeFilename(fs, dirname, base.FileTypeTable, f.FileNum)
+			path := base.MakeFilepath(fs, dirname, base.FileTypeTable, f.FileNum)
 			info, err := fs.Stat(path)
 			if err != nil {
 				buf.WriteString("L%d: %s: %v\n")
@@ -645,6 +1108,9 @@ func (l *VersionList) PushBack(v *Version) {
 	v.next = &l.root
 	v.next.prev = v
 	v.list = l
+	// Let L0Sublevels on the second newest version get GC'd, as it is no longer
+	// necessary. See the comment in Version.
+	v.prev.L0Sublevels = nil
 }
 
 // Remove removes the specified version from the list.
