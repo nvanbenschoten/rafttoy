@@ -105,9 +105,14 @@ func (p *pebble) Clear() {
 }
 
 func (p *pebble) CloseEngine() {
+	if p.db == nil {
+		// Already closed.
+		return
+	}
 	if err := p.db.Close(); err != nil {
 		log.Fatal(err)
 	}
+	p.db = nil
 	if err := os.RemoveAll(p.dir); err != nil {
 		log.Fatal(err)
 	}
