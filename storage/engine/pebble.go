@@ -44,6 +44,7 @@ func NewPebble(root string, disableWAL bool) Engine {
 	if err != nil {
 		log.Fatal(err)
 	}
+	fillLogRecycler(db)
 	return &pebble{
 		db:   db,
 		opts: opts,
@@ -54,6 +55,18 @@ func NewPebble(root string, disableWAL bool) Engine {
 
 func randDir(root string) string {
 	return filepath.Join(root, dirPrefix, strconv.FormatUint(rand.Uint64(), 10))
+}
+
+// Pebble recycles WAL files, which can lead to a speedup over time. Prime the
+// recycled files so that faster tests aren't penalized by slower log writes.
+func fillLogRecycler(db *pdb.DB) {
+	buf := make([]byte, 1<<16) // 64KiB
+	writes := 1024             // 64MiB
+	for i := 0; i < writes; i++ {
+		if err := db.Set([]byte("fill"), buf, optsForSync(i == writes-1)); err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 
 func (p *pebble) SetHardState(st raftpb.HardState, sync bool) {
@@ -101,6 +114,7 @@ func (p *pebble) Clear() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	fillLogRecycler(db)
 	p.db = db
 }
 
