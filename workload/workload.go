@@ -1,11 +1,15 @@
 package workload
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
+	"time"
 
 	"github.com/nvanbenschoten/rafttoy/proposal"
+	"golang.org/x/time/rate"
 )
 
 // Config contains various options to control a proposal workload.
@@ -14,6 +18,7 @@ type Config struct {
 	KeyLen    int
 	ValLen    int
 	Workers   int
+	MaxRate   int
 	Proposals int
 }
 
@@ -22,10 +27,11 @@ type Worker struct {
 	Config
 	workerIdx int
 
-	pEnd   int64
-	rng    *rand.Rand
-	p      proposal.Proposal
-	encBuf []byte
+	pEnd    int64
+	limiter *rate.Limiter
+	rng     *rand.Rand
+	p       proposal.Proposal
+	encBuf  []byte
 }
 
 // NewWorkers creates the set of workers described by the given Config.
@@ -35,6 +41,28 @@ func NewWorkers(cfg Config) []Worker {
 	}
 	val := make([]byte, cfg.ValLen)
 	rand.Read(val)
+
+	var limiters []*rate.Limiter
+	if cfg.MaxRate != 0 {
+		// Partition the limiter, which seems to help.
+		parts := cfg.MaxRate >> 14
+		if parts == 0 {
+			parts = 1
+		}
+		limiters = make([]*rate.Limiter, parts)
+		limit := rate.Limit(cfg.MaxRate / len(limiters))
+		for i := range limiters {
+			limiters[i] = rate.NewLimiter(limit, 1)
+		}
+
+		// Configure enough workers to satisfy rate, assuming max latency.
+		const maxExpLatency = 32 * time.Millisecond
+		cfg.Workers = (cfg.MaxRate * int(maxExpLatency)) / int(time.Second)
+		// Round up so that each limiter partition has an equal number of workers.
+		for (cfg.Workers/len(limiters))*len(limiters) != cfg.Workers {
+			cfg.Workers++
+		}
+	}
 
 	pPerWorker := int(math.Ceil(float64(cfg.Proposals) / float64(cfg.Workers)))
 	ws := make([]Worker, cfg.Workers)
@@ -56,6 +84,9 @@ func NewWorkers(cfg Config) []Worker {
 		}
 		copy(ws[i].p.Key, cfg.KeyPrefix)
 		ws[i].encBuf = make([]byte, proposal.Size(ws[i].p))
+		if limiters != nil {
+			ws[i].limiter = limiters[i%len(limiters)]
+		}
 	}
 	return ws
 }
@@ -68,6 +99,11 @@ func NewWorkers(cfg Config) []Worker {
 func (w *Worker) NextProposal() proposal.EncProposal {
 	if w.p.ID >= w.pEnd {
 		return nil
+	}
+	if w.limiter != nil {
+		if err := w.limiter.Wait(context.Background()); err != nil {
+			log.Fatal(err)
+		}
 	}
 	rand.Read(w.p.Key[len(w.KeyPrefix):])
 	enc := proposal.EncodeInto(w.p, w.encBuf)

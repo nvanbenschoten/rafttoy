@@ -11,6 +11,7 @@ require (
 	go.uber.org/zap v1.23.0
 	golang.org/x/net v0.0.0-20221004154528-8021a29435af
 	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4
+	golang.org/x/time v0.1.0
 	google.golang.org/grpc v1.50.0
 )
 

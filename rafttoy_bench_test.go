@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,15 +37,35 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-func BenchmarkRaft(b *testing.B) {
+func BenchmarkRaftClosed(b *testing.B) {
 	util.RunFor(b, "conc", 1, 1, 15, func(b *testing.B, conc int) {
 		util.RunFor(b, "bytes", 1, 2, 8, func(b *testing.B, bytes int) {
-			benchmarkRaft(b, conc, bytes)
+			benchmarkRaft(b, conc, 0, bytes)
 		})
 	})
 }
 
-func benchmarkRaft(b *testing.B, conc, bytes int) {
+func BenchmarkRaftOpen(b *testing.B) {
+	type key struct{ maxrate, bytes int }
+	var last key
+	logExpect := func(maxrate, bytes int) {
+		next := key{maxrate, bytes}
+		if next != last && last != (key{}) {
+			fmt.Printf("--- expected %.2f MB/s\n", float64(last.maxrate*last.bytes)/1e6)
+		}
+		last = next
+	}
+
+	util.RunFor(b, "maxrate", 128, 1, 13, func(b *testing.B, maxrate int) {
+		util.RunFor(b, "bytes", 1, 2, 8, func(b *testing.B, bytes int) {
+			benchmarkRaft(b, 0, maxrate, bytes)
+			logExpect(maxrate, bytes)
+		})
+	})
+	logExpect(0, 0)
+}
+
+func benchmarkRaft(b *testing.B, conc, maxrate, bytes int) {
 	cfg := cfgFromFlags()
 	cfg.Epoch = newEpoch()
 	p := newPeer(cfg)
@@ -59,6 +80,7 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 		KeyLen:    len(engine.MinDataKey) + 8,
 		ValLen:    bytes,
 		Workers:   conc,
+		MaxRate:   maxrate,
 		Proposals: b.N,
 	})
 
@@ -70,14 +92,15 @@ func benchmarkRaft(b *testing.B, conc, bytes int) {
 		worker := workers[i]
 		g.Go(func() error {
 			c := make(chan bool, 1)
-			start := time.Now()
+			var dur time.Duration
 			for prop := worker.NextProposal(); prop != nil; prop = worker.NextProposal() {
+				start := time.Now()
 				if !p.ProposeWith(prop, c) {
 					return errors.New("proposal failed")
 				}
+				dur += time.Since(start)
 			}
-			dur := time.Since(start).Nanoseconds()
-			atomic.AddInt64(&aggDur, dur)
+			atomic.AddInt64(&aggDur, dur.Nanoseconds())
 			return nil
 		})
 	}
