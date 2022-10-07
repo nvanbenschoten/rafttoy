@@ -1,5 +1,7 @@
 package pipeline
 
+import "github.com/nvanbenschoten/rafttoy/metric"
+
 // parallelAppender is similar to a standard proposal pipeline except
 // that it broadcasts MsgApp messages before syncing them to the leader's
 // local log. This allows them to be appended in parallel on all peers.
@@ -15,7 +17,7 @@ func NewParallelAppender(earlyAck bool) Pipeline {
 }
 
 func (pl *parallelAppender) RunOnce() {
-	defer measurePipelineLat()()
+	defer metric.MeasureLat(metric.PipelineLatencyHistogram)()
 	rd := pl.n.Ready()
 	pl.l.Unlock()
 	if pl.earlyAck {

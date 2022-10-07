@@ -3,6 +3,7 @@ package metric
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/rcrowley/go-metrics"
 )
@@ -37,6 +38,12 @@ var ApplyBatchSizesHistogram metrics.Histogram = metrics.NilHistogram{}
 // pipeline iterations.
 var PipelineLatencyHistogram metrics.Histogram = metrics.NilHistogram{}
 
+// AppendLatencyHistogram records the latency of a log append batch.
+var AppendLatencyHistogram metrics.Histogram = metrics.NilHistogram{}
+
+// ApplyLatencyHistogram records the latency of a log apply batch.
+var ApplyLatencyHistogram metrics.Histogram = metrics.NilHistogram{}
+
 func registerAll() {
 	AppendBatchSizesHistogram = metrics.NewRegisteredHistogram(
 		"append_batch_sizes",
@@ -50,6 +57,16 @@ func registerAll() {
 	)
 	PipelineLatencyHistogram = metrics.NewRegisteredHistogram(
 		"pipeline_latency_us",
+		metrics.DefaultRegistry,
+		metrics.NewUniformSample(1024),
+	)
+	AppendLatencyHistogram = metrics.NewRegisteredHistogram(
+		"append_latency_us",
+		metrics.DefaultRegistry,
+		metrics.NewUniformSample(1024),
+	)
+	ApplyLatencyHistogram = metrics.NewRegisteredHistogram(
+		"apply_latency_us",
 		metrics.DefaultRegistry,
 		metrics.NewUniformSample(1024),
 	)
@@ -80,4 +97,22 @@ func printMetrics() {
 		}
 	}
 	fmt.Printf("-------------------------------------------------\n\n")
+}
+
+// MeasureLat measures the delay between the time that the function is first
+// called and the time that the returned closure is called. This value is
+// recorded into the provided histogram.
+//
+// Suggested use looks like:
+//
+//	defer metric.MeasureLat(metric.AppendBatchSizesHistogram)()
+func MeasureLat(h metrics.Histogram) func() {
+	if !Enabled() {
+		return func() {}
+	}
+	start := time.Now()
+	return func() {
+		lat := time.Since(start)
+		h.Update(int64(lat / time.Microsecond))
+	}
 }

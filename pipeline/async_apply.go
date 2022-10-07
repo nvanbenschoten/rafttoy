@@ -45,7 +45,7 @@ func NewAsyncApplier(earlyAck, lazyFollower bool) Pipeline {
 }
 
 func (pl *asyncApplier) RunOnce() {
-	defer measurePipelineLat()()
+	defer metric.MeasureLat(metric.PipelineLatencyHistogram)()
 	rd := pl.n.Ready()
 	pl.l.Unlock()
 	if rd.SoftState != nil {

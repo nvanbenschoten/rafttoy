@@ -3,7 +3,6 @@ package pipeline
 import (
 	"log"
 	"sync"
-	"time"
 
 	"github.com/nvanbenschoten/rafttoy/config"
 	"github.com/nvanbenschoten/rafttoy/metric"
@@ -27,20 +26,10 @@ type Pipeline interface {
 	RunOnce()
 }
 
-func measurePipelineLat() func() {
-	if !metric.Enabled() {
-		return func() {}
-	}
-	start := time.Now()
-	return func() {
-		lat := time.Since(start)
-		metric.PipelineLatencyHistogram.Update(int64(lat / time.Microsecond))
-	}
-}
-
 func saveToDisk(s storage.Storage, ents []raftpb.Entry, st raftpb.HardState, sync bool) {
 	if len(ents) > 0 {
 		metric.AppendBatchSizesHistogram.Update(int64(len(ents)))
+		defer metric.MeasureLat(metric.AppendLatencyHistogram)()
 	}
 	if as, ok := s.(storage.AtomicStorage); ok {
 		as.AppendAndSetHardState(ents, st, sync)
@@ -103,6 +92,7 @@ func applyToStore(
 		return
 	}
 	metric.ApplyBatchSizesHistogram.Update(int64(len(ents)))
+	defer metric.MeasureLat(metric.ApplyLatencyHistogram)()
 	if be, ok := s.(engine.BatchingEngine); ok {
 		// Apply all entries at once then ack all entries at once.
 		st := 0

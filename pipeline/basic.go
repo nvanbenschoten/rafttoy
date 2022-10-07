@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/nvanbenschoten/rafttoy/config"
+	"github.com/nvanbenschoten/rafttoy/metric"
 	"github.com/nvanbenschoten/rafttoy/proposal"
 	"github.com/nvanbenschoten/rafttoy/storage"
 	"github.com/nvanbenschoten/rafttoy/transport"
@@ -43,7 +44,7 @@ func (pl *basic) Init(
 }
 
 func (pl *basic) RunOnce() {
-	defer measurePipelineLat()()
+	defer metric.MeasureLat(metric.PipelineLatencyHistogram)()
 	rd := pl.n.Ready()
 	pl.l.Unlock()
 	saveToDisk(pl.s, rd.Entries, rd.HardState, rd.MustSync)
