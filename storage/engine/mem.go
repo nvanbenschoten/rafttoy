@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"log"
 	"unsafe"
 
 	"github.com/nvanbenschoten/rafttoy/proposal"
@@ -19,12 +18,6 @@ func NewMem() Engine {
 	return &mem{
 		m:  raft.NewMemoryStorage(),
 		kv: make(map[string][]byte),
-	}
-}
-
-func (m *mem) SetHardState(st raftpb.HardState, _ bool) {
-	if err := m.m.SetHardState(st); err != nil {
-		log.Fatal(err)
 	}
 }
 

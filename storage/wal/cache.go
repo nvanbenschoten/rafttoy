@@ -27,6 +27,9 @@ func MakeLogCache(trunc bool) LogCache {
 
 // UpdateOnAppend updates the cache based on the newly-appended entries.
 func (c *LogCache) UpdateOnAppend(ents []raftpb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
 	last := ents[len(ents)-1]
 	c.lastIndex = last.Index
 	c.lastTerm = last.Term

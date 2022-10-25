@@ -26,7 +26,7 @@ func benchmarkWalConfig(b *testing.B, batchSize, bytes int, w wal.Wal) {
 	entries := make([]raftpb.Entry, 0, batchSize)
 	appendEntries := func() {
 		if len(entries) > 0 {
-			w.Append(entries)
+			w.Append(entries, raftpb.HardState{}, true /* sync */)
 			entries = entries[:0]
 		}
 	}

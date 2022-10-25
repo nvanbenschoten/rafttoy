@@ -31,18 +31,7 @@ func saveToDisk(s storage.Storage, ents []raftpb.Entry, st raftpb.HardState, syn
 		metric.AppendBatchSizesHistogram.Update(int64(len(ents)))
 		defer metric.MeasureLat(metric.AppendLatencyHistogram)()
 	}
-	if as, ok := s.(storage.AtomicStorage); ok {
-		as.AppendAndSetHardState(ents, st, sync)
-	} else {
-		if len(ents) > 0 {
-			s.Append(ents)
-		}
-		if !raft.IsEmptyHardState(st) {
-			// This isn't exactly correct, but it's close enough.
-			syncHS := sync && len(ents) == 0
-			s.SetHardState(st, syncHS)
-		}
-	}
+	s.Append(ents, st, sync)
 }
 
 func sendMessages(t transport.Transport, epoch config.TestEpoch, msgs []raftpb.Message) {

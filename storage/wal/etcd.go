@@ -41,8 +41,8 @@ func randDir(root string) string {
 	return filepath.Join(root, dirPrefix, strconv.FormatUint(rand.Uint64(), 10))
 }
 
-func (w *etcdWal) Append(ents []raftpb.Entry) {
-	if err := w.w.Save(raftpb.HardState{}, ents); err != nil {
+func (w *etcdWal) Append(ents []raftpb.Entry, st raftpb.HardState, sync bool) {
+	if err := w.w.Save(st, ents); err != nil {
 		log.Fatal(err)
 	}
 	w.c.UpdateOnAppend(ents)

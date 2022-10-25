@@ -69,16 +69,6 @@ func fillLogRecycler(db *pdb.DB) {
 	}
 }
 
-func (p *pebble) SetHardState(st raftpb.HardState, sync bool) {
-	buf, err := st.Marshal()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := p.db.Set(hardStateKey, buf, optsForSync(sync && !p.opts.DisableWAL)); err != nil {
-		log.Fatal(err)
-	}
-}
-
 func (p *pebble) ApplyEntry(ent raftpb.Entry) {
 	prop := proposal.Decode(ent.Data)
 	if err := p.db.Set(prop.Key, prop.Val, pdb.NoSync); err != nil {
@@ -177,17 +167,28 @@ func decodeRaftLogKey(k []byte) uint64 {
 	return v
 }
 
-func (p *pebble) Append(ents []raftpb.Entry) {
-	if len(ents) == 0 {
+func (p *pebble) Append(ents []raftpb.Entry, st raftpb.HardState, sync bool) {
+	if len(ents) == 0 && raft.IsEmptyHardState(st) {
 		return
 	}
 	b := p.db.NewBatch()
 	defer b.Close()
-	appendEntsToBatch(b, ents)
-	if err := b.Commit(pdb.Sync); err != nil {
+	if len(ents) > 0 {
+		appendEntsToBatch(b, ents)
+		p.c.UpdateOnAppend(ents)
+	}
+	if !raft.IsEmptyHardState(st) {
+		buf, err := st.Marshal()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := b.Set(hardStateKey, buf, nil); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := b.Commit(optsForSync(sync)); err != nil {
 		log.Fatal(err)
 	}
-	p.c.UpdateOnAppend(ents)
 }
 
 func appendEntsToBatch(b *pdb.Batch, ents []raftpb.Entry) {
@@ -277,35 +278,6 @@ func (p *pebble) Truncate() {
 
 func (p *pebble) CloseWal() {
 	p.CloseEngine()
-}
-
-//////////////////////////////////////////////////////
-// When used as a Raft log and as an Engine, a Pebble
-// database can implement AtomicStorage.
-//////////////////////////////////////////////////////
-
-func (p *pebble) AppendAndSetHardState(ents []raftpb.Entry, st raftpb.HardState, sync bool) {
-	if len(ents) == 0 && raft.IsEmptyHardState(st) {
-		return
-	}
-	b := p.db.NewBatch()
-	defer b.Close()
-	if len(ents) > 0 {
-		appendEntsToBatch(b, ents)
-		p.c.UpdateOnAppend(ents)
-	}
-	if !raft.IsEmptyHardState(st) {
-		buf, err := st.Marshal()
-		if err != nil {
-			log.Fatal(err)
-		}
-		if err := b.Set(hardStateKey, buf, nil); err != nil {
-			log.Fatal(err)
-		}
-	}
-	if err := b.Commit(optsForSync(sync)); err != nil {
-		log.Fatal(err)
-	}
 }
 
 func optsForSync(sync bool) *pdb.WriteOptions {
