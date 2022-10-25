@@ -8,7 +8,7 @@ import (
 	"strconv"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
-	etcdwal "go.etcd.io/etcd/server/v3/wal"
+	etcdwal "go.etcd.io/etcd/server/v3/storage/wal"
 	"go.uber.org/zap"
 )
 

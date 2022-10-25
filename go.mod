@@ -1,12 +1,14 @@
 module github.com/nvanbenschoten/rafttoy
 
+go 1.18
+
 require (
 	github.com/cockroachdb/pebble v0.0.0-20221005185728-eec7375f9c44
 	github.com/gogo/protobuf v1.3.2
 	github.com/pkg/errors v0.9.1
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475
 	github.com/spf13/pflag v1.0.5
-	go.etcd.io/etcd/raft/v3 v3.5.5
+	go.etcd.io/etcd/raft/v3 v3.6.0-alpha.0
 	go.etcd.io/etcd/server/v3 v3.5.5
 	go.uber.org/zap v1.23.0
 	golang.org/x/net v0.0.0-20221004154528-8021a29435af
@@ -23,6 +25,7 @@ require (
 	github.com/cockroachdb/errors v1.9.0 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20211118104740-dabe8e521a4f // indirect
 	github.com/cockroachdb/redact v1.1.3 // indirect
+	github.com/coreos/go-semver v0.3.0 // indirect
 	github.com/getsentry/sentry-go v0.14.0 // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
@@ -35,8 +38,9 @@ require (
 	github.com/prometheus/common v0.37.0 // indirect
 	github.com/prometheus/procfs v0.8.0 // indirect
 	github.com/rogpeppe/go-internal v1.9.0 // indirect
-	go.etcd.io/etcd/client/pkg/v3 v3.5.5 // indirect
-	go.etcd.io/etcd/pkg/v3 v3.5.5 // indirect
+	go.etcd.io/etcd/api/v3 v3.6.0-alpha.0 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.6.0-alpha.0 // indirect
+	go.etcd.io/etcd/pkg/v3 v3.6.0-alpha.0 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
 	golang.org/x/exp v0.0.0-20221006183845-316c7553db56 // indirect
@@ -46,19 +50,12 @@ require (
 	google.golang.org/protobuf v1.28.1 // indirect
 )
 
-go 1.18
+replace go.etcd.io/etcd/api/v3 => ../etcd/api
 
-// At the time of writing (i.e. as of this version below) the `etcd` repo is in the process of properly introducing
-// modules, and as part of that uses an unsatisfiable version for this dependency (v3.0.0-00010101000000-000000000000).
-// We just force it to the same SHA as the `go.etcd.io/etcd/raft/v3` module (they live in the same VCS root).
-//
-// While this is necessary, make sure that the require block above does not diverge.
-replace go.etcd.io/etcd/api/v3 => go.etcd.io/etcd/api/v3 v3.0.0-20201109164711-01844fd28560
+replace go.etcd.io/etcd/server/v3 => ../etcd/server
 
-replace go.etcd.io/etcd/client/v2 => go.etcd.io/etcd/client/v2 v2.0.0-20201109164711-01844fd28560
+replace go.etcd.io/etcd/client/pkg/v3 => ../etcd/client/pkg
 
-replace go.etcd.io/etcd/client/v3 => go.etcd.io/etcd/client/v3 v3.0.0-20201109164711-01844fd28560
+replace go.etcd.io/etcd/pkg/v3 => ../etcd/pkg
 
-replace go.etcd.io/etcd/pkg/v3 => go.etcd.io/etcd/pkg/v3 v3.0.0-20201109164711-01844fd28560
-
-replace go.etcd.io/etcd/raft/v3 => go.etcd.io/etcd/raft/v3 v3.0.0-20201109164711-01844fd28560
+replace go.etcd.io/etcd/raft/v3 => ../etcd/raft

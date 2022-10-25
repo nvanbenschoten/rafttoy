@@ -52,14 +52,15 @@ type Config struct {
 	PeerAddrs map[uint64]string
 }
 
-func makeRaftCfg(cfg Config, s storage.Storage) *raft.Config {
+func makeRaftCfg(cfg Config, s storage.Storage, asyncStorageWrites bool) *raft.Config {
 	return &raft.Config{
 		ID:                        cfg.ID,
 		ElectionTick:              3,
 		HeartbeatTick:             1,
 		MaxSizePerMsg:             math.MaxUint64,
-		MaxInflightMsgs:           int(math.MaxInt64),
+		MaxInflightMsgs:           math.MaxInt64,
 		Storage:                   util.NewRaftStorage(s),
+		AsyncStorageWrites:        asyncStorageWrites,
 		PreVote:                   true,
 		DisableProposalForwarding: true,
 	}
@@ -72,7 +73,7 @@ func New(
 	t transport.Transport,
 	pl pipeline.Pipeline,
 ) *Peer {
-	raftCfg := makeRaftCfg(cfg, s)
+	raftCfg := makeRaftCfg(cfg, s, pl.AsyncStorageWrites())
 	n, err := raft.NewRawNode(raftCfg)
 	if err != nil {
 		log.Fatal(err)
@@ -90,7 +91,7 @@ func New(
 		msgs: make(chan *transpb.RaftMsg, 1024),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
-	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)
+	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt, p.signal)
 	p.pb.init()
 	p.flushPropsFn = p.flushProps
 	go p.t.Serve(p)
@@ -234,7 +235,7 @@ func (p *Peer) bumpEpoch(epoch config.TestEpoch) {
 	p.s.Truncate()
 	p.s.Clear()
 	p.cfg.Epoch = epoch
-	raftCfg := makeRaftCfg(p.cfg, p.s)
+	raftCfg := makeRaftCfg(p.cfg, p.s, p.pl.AsyncStorageWrites())
 	n, err := raft.NewRawNode(raftCfg)
 	if err != nil {
 		log.Fatal(err)

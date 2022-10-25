@@ -20,6 +20,7 @@ type basic struct {
 	s     storage.Storage
 	t     transport.Transport
 	pt    *proposal.Tracker
+	sig   func()
 }
 
 // NewBasic creates a new "basic" pipeline.
@@ -34,6 +35,7 @@ func (pl *basic) Init(
 	s storage.Storage,
 	t transport.Transport,
 	pt *proposal.Tracker,
+	sig func(),
 ) {
 	pl.epoch = epoch
 	pl.l = l
@@ -41,6 +43,11 @@ func (pl *basic) Init(
 	pl.s = s
 	pl.t = t
 	pl.pt = pt
+	pl.sig = sig
+}
+
+func (pl *basic) AsyncStorageWrites() bool {
+	return false
 }
 
 func (pl *basic) RunOnce() {

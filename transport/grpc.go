@@ -25,7 +25,6 @@ type grpc struct {
 	dialCancel func()
 	clientMu   sync.Mutex
 	clientBufs map[uint64]chan<- *transpb.RaftMsg
-	sortBuf    byDestination
 }
 
 // NewGRPC creates a new Transport that uses gRPC streams.
@@ -105,8 +104,8 @@ func (g *grpc) Send(epoch config.TestEpoch, msgs []raftpb.Message) {
 }
 
 func (g *grpc) sortMsgs(msgs []raftpb.Message) {
-	g.sortBuf = msgs
-	sort.Sort(&g.sortBuf)
+	sortBuf := byDestination(msgs)
+	sort.Sort(&sortBuf)
 }
 
 // byDestination implements sort.Interface.
