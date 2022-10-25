@@ -33,7 +33,11 @@ New metrics can be defined in `metrics/metrics.go`.
 ```
 # Create a roachprod cluster
 > export CLUSTER=$USER-raft
+
+# For local instance store volumes.
 > roachprod create $CLUSTER --nodes=3 --clouds=aws --aws-machine-type-ssd=m5d.4xlarge
+# For EBS volumes.
+> roachprod create $CLUSTER --nodes=3 --clouds=aws --aws-machine-type=m5.4xlarge --local-ssd=false --aws-ebs-volume-type=gp3 --aws-ebs-throughput=1000 --aws-ebs-iops=16000 --aws-ebs-volume-size=500
 
 # Build the leader and follower binaries for linux. Requires Go 1.12.
 > GOOS=linux GOARCH=amd64 make build
