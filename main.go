@@ -96,7 +96,7 @@ func main() {
 	defer p.Stop()
 
 	// Wait for the initial leader election to complete.
-	becomeLeader(p)
+	p.BecomeLeader()
 
 	prop := proposal.Proposal{
 		Key: []byte("key"),
@@ -135,20 +135,4 @@ func servePProf(port int) {
 			log.Fatal(err)
 		}
 	}()
-}
-
-func becomeLeader(p *peer.Peer) {
-	prop := proposal.Proposal{
-		Key: []byte("key"),
-		Val: make([]byte, 1),
-	}
-	var lastCamp time.Time
-	for !p.Propose(prop) {
-		if now := time.Now(); now.Sub(lastCamp) > 250*time.Millisecond {
-			p.Campaign()
-			lastCamp = now
-		}
-		time.Sleep(1 * time.Millisecond)
-	}
-	p.WaitForAllCaughtUp()
 }

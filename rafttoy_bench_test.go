@@ -73,7 +73,7 @@ func benchmarkRaft(b *testing.B, conc, maxrate, bytes int) {
 	defer p.Stop()
 
 	// Wait for the initial leader election to complete.
-	becomeLeader(p)
+	p.BecomeLeader()
 
 	workers := workload.NewWorkers(workload.Config{
 		KeyPrefix: engine.MinDataKey,

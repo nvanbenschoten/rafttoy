@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -37,7 +38,7 @@ func (g *grpc) Init(addr string, peers map[uint64]string) {
 	g.peers = peers
 	g.clientBufs = make(map[uint64]chan<- *transpb.RaftMsg)
 	g.dialCtx, g.dialCancel = context.WithCancel(context.Background())
-	g.rpc = rpc.NewServer()
+	g.rpc = rpc.NewServer(rpc.MaxRecvMsgSize(math.MaxInt32))
 	transpb.RegisterRaftServiceServer(g.rpc, g)
 }
 

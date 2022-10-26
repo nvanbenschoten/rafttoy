@@ -7,7 +7,7 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
-const cacheByteLimit = 512 << 20 // 512 MB
+const cacheByteLimit = 512 << 30 // 512 GB
 const cacheSizeTarget = 2048
 
 // LogCache caches state about the Raft log in-memory to avoid on-disk lookups.

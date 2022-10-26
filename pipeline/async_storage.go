@@ -188,6 +188,8 @@ func (pl *asyncStorage) Pause() {
 	syncC = make(chan struct{})
 	pl.toApply.push(applyEvent{sync: syncC})
 	<-syncC
+	// Clear responses.
+	_ = pl.resps.take()
 }
 
 func (pl *asyncStorage) Stop() {

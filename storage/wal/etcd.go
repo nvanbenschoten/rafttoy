@@ -52,7 +52,7 @@ func (w *etcdWal) Entries(lo, hi uint64) []raftpb.Entry {
 	n := hi - lo
 	ents := make([]raftpb.Entry, 0, n)
 	ents, _ = w.c.Entries(ents, lo, hi)
-	if uint64(len(ents)) != hi-lo {
+	if uint64(len(ents)) != n {
 		log.Fatalf("missing entries in entry cache [%d,%d)", lo, hi)
 	}
 	return ents
