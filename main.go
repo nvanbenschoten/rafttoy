@@ -31,16 +31,16 @@ func newPeer(cfg peer.Config) *peer.Peer {
 	// Storage.
 	//  WAL.
 	var _ wal.Wal // avoid import thrashing
-	w := wal.NewMem(5 * time.Millisecond)
-	// w := engine.NewPebble(*dataDir, false).(wal.Wal)
-	// w := wal.NewEtcdWal(*dataDir)
+	//w := wal.NewMem(5 * time.Millisecond)
+	//w := engine.NewPebble(*dataDir, false).(wal.Wal)
+	w := wal.NewEtcdWal(*dataDir)
 	//  Engine.
 	// e := engine.NewMem()
-	// e := engine.NewPebble(*dataDir, false)
-	e := engine.NewPebble(*dataDir, true)
+	e := engine.NewPebble(*dataDir, false)
+	//e := engine.NewPebble(*dataDir, true)
 	//  Combined.
 	s := storage.CombineWalAndEngine(w, e)
-	// s := engine.NewPebble(*dataDir, false).(storage.Storage)
+	//s := engine.NewPebble(*dataDir, false).(storage.Storage)
 
 	// Transport.
 	t := transport.NewGRPC()
@@ -54,12 +54,12 @@ func newPeer(cfg peer.Config) *peer.Peer {
 		pl = pipeline.NewParallelAppender(false /* earlyAck */)
 	case "parallel-append-early-ack":
 		pl = pipeline.NewParallelAppender(true /* earlyAck */)
-	case "async-apply":
-		pl = pipeline.NewAsyncApplier(false /* earlyAck */, false /* lazyFollower */)
-	case "async-apply-early-ack":
-		pl = pipeline.NewAsyncApplier(true /* earlyAck */, false /* lazyFollower */)
-	case "async-apply-early-ack-lazy-follower":
-		pl = pipeline.NewAsyncApplier(true /* earlyAck */, true /* lazyFollower */)
+	case "async-storage":
+		pl = pipeline.NewAsyncStorage(false /* earlyAck */, false /* lazyFollower */)
+	case "async-storage-early-ack":
+		pl = pipeline.NewAsyncStorage(true /* earlyAck */, false /* lazyFollower */)
+	case "async-storage-early-ack-lazy-follower":
+		pl = pipeline.NewAsyncStorage(true /* earlyAck */, true /* lazyFollower */)
 	default:
 		log.Fatalf("unknown pipeline %q", *pipelineImpl)
 	}
@@ -96,7 +96,7 @@ func main() {
 	defer p.Stop()
 
 	// Wait for the initial leader election to complete.
-	becomeLeader(p)
+	p.BecomeLeader()
 
 	prop := proposal.Proposal{
 		Key: []byte("key"),
@@ -135,20 +135,4 @@ func servePProf(port int) {
 			log.Fatal(err)
 		}
 	}()
-}
-
-func becomeLeader(p *peer.Peer) {
-	prop := proposal.Proposal{
-		Key: []byte("key"),
-		Val: make([]byte, 1),
-	}
-	var lastCamp time.Time
-	for !p.Propose(prop) {
-		if now := time.Now(); now.Sub(lastCamp) > 250*time.Millisecond {
-			p.Campaign()
-			lastCamp = now
-		}
-		time.Sleep(1 * time.Millisecond)
-	}
-	p.WaitForAllCaughtUp()
 }

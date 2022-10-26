@@ -7,7 +7,7 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
-const cacheByteLimit = 512 << 20 // 512 MB
+const cacheByteLimit = 512 << 30 // 512 GB
 const cacheSizeTarget = 2048
 
 // LogCache caches state about the Raft log in-memory to avoid on-disk lookups.
@@ -27,6 +27,9 @@ func MakeLogCache(trunc bool) LogCache {
 
 // UpdateOnAppend updates the cache based on the newly-appended entries.
 func (c *LogCache) UpdateOnAppend(ents []raftpb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
 	last := ents[len(ents)-1]
 	c.lastIndex = last.Index
 	c.lastTerm = last.Term

@@ -4,7 +4,6 @@ import "go.etcd.io/etcd/raft/v3/raftpb"
 
 // Engine represents a storage engine that Raft entries are applied to.
 type Engine interface {
-	SetHardState(raftpb.HardState, bool)
 	ApplyEntry(raftpb.Entry)
 	Clear()
 	CloseEngine()

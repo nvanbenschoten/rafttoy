@@ -22,9 +22,14 @@ func NewMem(delay time.Duration) Wal {
 	}
 }
 
-func (m *mem) Append(ents []raftpb.Entry) {
+func (m *mem) Append(ents []raftpb.Entry, st raftpb.HardState, _ bool) {
 	if err := m.m.Append(ents); err != nil {
 		log.Fatal(err)
+	}
+	if !raft.IsEmptyHardState(st) {
+		if err := m.m.SetHardState(st); err != nil {
+			log.Fatal(err)
+		}
 	}
 	if m.delay != 0 {
 		time.Sleep(m.delay)

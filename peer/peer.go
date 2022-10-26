@@ -16,7 +16,6 @@ import (
 	"github.com/nvanbenschoten/rafttoy/util"
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
-	"go.etcd.io/etcd/raft/v3/tracker"
 )
 
 // Peer is a member of a Raft consensus group. Its primary roles are to:
@@ -26,7 +25,7 @@ import (
 type Peer struct {
 	mu   sync.Mutex
 	sig  chan struct{} // signaled to wake-up Raft loop
-	done int32
+	done atomic.Bool
 	wg   sync.WaitGroup
 
 	cfg Config
@@ -39,6 +38,7 @@ type Peer struct {
 	pb propBuf
 	pt proposal.Tracker
 
+	leader       atomic.Bool
 	msgs         chan *transpb.RaftMsg
 	flushPropsFn func([]propBufElem)
 }
@@ -52,14 +52,15 @@ type Config struct {
 	PeerAddrs map[uint64]string
 }
 
-func makeRaftCfg(cfg Config, s storage.Storage) *raft.Config {
+func makeRaftCfg(cfg Config, s storage.Storage, asyncStorageWrites bool) *raft.Config {
 	return &raft.Config{
 		ID:                        cfg.ID,
-		ElectionTick:              3,
-		HeartbeatTick:             1,
+		ElectionTick:              50,
+		HeartbeatTick:             5,
 		MaxSizePerMsg:             math.MaxUint64,
-		MaxInflightMsgs:           int(math.MaxInt64),
+		MaxInflightMsgs:           math.MaxInt,
 		Storage:                   util.NewRaftStorage(s),
+		AsyncStorageWrites:        asyncStorageWrites,
 		PreVote:                   true,
 		DisableProposalForwarding: true,
 	}
@@ -72,7 +73,7 @@ func New(
 	t transport.Transport,
 	pl pipeline.Pipeline,
 ) *Peer {
-	raftCfg := makeRaftCfg(cfg, s)
+	raftCfg := makeRaftCfg(cfg, s, pl.AsyncStorageWrites())
 	n, err := raft.NewRawNode(raftCfg)
 	if err != nil {
 		log.Fatal(err)
@@ -90,7 +91,7 @@ func New(
 		msgs: make(chan *transpb.RaftMsg, 1024),
 	}
 	p.t.Init(cfg.SelfAddr, cfg.PeerAddrs)
-	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt)
+	p.pl.Init(p.cfg.Epoch, &p.mu, p.n, p.s, p.t, &p.pt, p.signal)
 	p.pb.init()
 	p.flushPropsFn = p.flushProps
 	go p.t.Serve(p)
@@ -135,6 +136,11 @@ func (p *Peer) ticker() {
 	for !p.stopped() {
 		<-t.C
 		p.mu.Lock()
+		if p.leader.Load() {
+			if p.n.BasicStatus().RaftState != raft.StateLeader {
+				log.Fatal("raft leadership unexpectedly lost")
+			}
+		}
 		p.n.Tick()
 		p.mu.Unlock()
 		p.signal()
@@ -143,7 +149,7 @@ func (p *Peer) ticker() {
 
 // Stop stops all processing and releases all resources held by Peer.
 func (p *Peer) Stop() {
-	atomic.StoreInt32(&p.done, 1)
+	p.done.Store(true)
 	p.signal()
 	p.t.Close()
 	p.wg.Wait()
@@ -154,7 +160,7 @@ func (p *Peer) Stop() {
 }
 
 func (p *Peer) stopped() bool {
-	return atomic.LoadInt32(&p.done) == 1
+	return p.done.Load()
 }
 
 // Campaign causes the Peer to transition to the candidate state
@@ -234,7 +240,7 @@ func (p *Peer) bumpEpoch(epoch config.TestEpoch) {
 	p.s.Truncate()
 	p.s.Clear()
 	p.cfg.Epoch = epoch
-	raftCfg := makeRaftCfg(p.cfg, p.s)
+	raftCfg := makeRaftCfg(p.cfg, p.s, p.pl.AsyncStorageWrites())
 	n, err := raft.NewRawNode(raftCfg)
 	if err != nil {
 		log.Fatal(err)
@@ -244,23 +250,50 @@ func (p *Peer) bumpEpoch(epoch config.TestEpoch) {
 	p.pl.Resume(epoch, n)
 }
 
-// WaitForAllCaughtUp waits for all peers to catch up to the same log index.
-func (p *Peer) WaitForAllCaughtUp() {
+// BecomeLeader waits for the peer to become the Raft leader.
+func (p *Peer) BecomeLeader() {
+	var lastCamp time.Time
 	for {
+		time.Sleep(10 * time.Millisecond)
 		p.mu.Lock()
-		var match uint64
+		st := p.n.Status()
+		p.mu.Unlock()
+
+		// Wait until we're the raft leader.
+		if st.RaftState != raft.StateLeader {
+			if now := time.Now(); now.Sub(lastCamp) > 250*time.Millisecond {
+				// Campaign every 250ms.
+				p.Campaign()
+				lastCamp = now
+			}
+			continue
+		}
+
+		// Wait for all peers to catch up to the same log index.
 		caughtUp := true
-		p.n.WithProgress(func(id uint64, _ raft.ProgressType, pr tracker.Progress) {
+		var match uint64
+		for _, pr := range st.Progress {
 			if match == 0 {
 				match = pr.Match
 			} else {
 				caughtUp = caughtUp && match == pr.Match
 			}
-		})
-		p.mu.Unlock()
-		if caughtUp {
-			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		if !caughtUp {
+			continue
+		}
+
+		// Submit a proposal to verify that we're actually the leader.
+		prop := proposal.Proposal{
+			Key: []byte("key"),
+			Val: make([]byte, 1),
+		}
+		if !p.Propose(prop) {
+			continue
+		}
+
+		// Success.
+		break
 	}
+	p.leader.Store(true)
 }

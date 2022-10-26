@@ -18,7 +18,8 @@ import (
 // the interactions between a Raft "raw node" and the various components that
 // the Raft "raw node" needs to coordinate with.
 type Pipeline interface {
-	Init(config.TestEpoch, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker)
+	Init(config.TestEpoch, sync.Locker, *raft.RawNode, storage.Storage, transport.Transport, *proposal.Tracker, func())
+	AsyncStorageWrites() bool
 	Start()
 	Pause()
 	Resume(config.TestEpoch, *raft.RawNode)
@@ -31,18 +32,7 @@ func saveToDisk(s storage.Storage, ents []raftpb.Entry, st raftpb.HardState, syn
 		metric.AppendBatchSizesHistogram.Update(int64(len(ents)))
 		defer metric.MeasureLat(metric.AppendLatencyHistogram)()
 	}
-	if as, ok := s.(storage.AtomicStorage); ok {
-		as.AppendAndSetHardState(ents, st, sync)
-	} else {
-		if len(ents) > 0 {
-			s.Append(ents)
-		}
-		if !raft.IsEmptyHardState(st) {
-			// This isn't exactly correct, but it's close enough.
-			syncHS := sync && len(ents) == 0
-			s.SetHardState(st, syncHS)
-		}
-	}
+	s.Append(ents, st, sync)
 }
 
 func sendMessages(t transport.Transport, epoch config.TestEpoch, msgs []raftpb.Message) {
@@ -56,6 +46,20 @@ func splitMsgApps(msgs []raftpb.Message) (msgApps, otherMsgs []raftpb.Message) {
 	splitIdx := 0
 	for i, msg := range msgs {
 		if msg.Type == raftpb.MsgApp {
+			msgs[i], msgs[splitIdx] = msgs[splitIdx], msgs[i]
+			splitIdx++
+		}
+	}
+	return msgs[:splitIdx], msgs[splitIdx:]
+}
+
+func splitLocalMsgs(msgs []raftpb.Message) (remote, local []raftpb.Message) {
+	isLocalMsg := func(msg raftpb.Message) bool {
+		return raft.IsLocalMsgTarget(msg.From) || raft.IsLocalMsgTarget(msg.To) || msg.From == msg.To
+	}
+	splitIdx := 0
+	for i, msg := range msgs {
+		if !isLocalMsg(msg) {
 			msgs[i], msgs[splitIdx] = msgs[splitIdx], msgs[i]
 			splitIdx++
 		}

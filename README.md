@@ -12,13 +12,13 @@ are driven by a `Peer` object, which performs scheduling and orchestrates their
 interactions. Each components is defined as an interface so that different
 implementations can be experimented with.
 
-| Component        |  Description                                                                           |  Implementations |
-|------------------|----------------------------------------------------------------------------------------|------------------|
-| `storage/wal`    | A write-ahead log used to store the Raft log                                           | `mem`, `pebble`, `etcdWal` |
-| `storage/engine` | A storage engine that Raft entries are applied to                                      | `mem`, `pebble` |
-| `storage`        | A combined Raft log and storage engine. Can be implemented by a single entity or split | `splitStorage(wal,engine)`, `pebble` |
-| `transport`      | An interconnect between Raft peers to facilitate message passing                       | `grpc` |
-| `pipeline`       | A Raft proposal pipeline loop which handles `raft.Ready` objects                       | `basic`, `parallelAppender`, `asyncApplier(earlyAck, lazyFollower)` |
+| Component        |  Description                                                                           | Implementations                                                     |
+|------------------|----------------------------------------------------------------------------------------|---------------------------------------------------------------------|
+| `storage/wal`    | A write-ahead log used to store the Raft log                                           | `mem`, `pebble`, `etcdWal`                                          |
+| `storage/engine` | A storage engine that Raft entries are applied to                                      | `mem`, `pebble`                                                     |
+| `storage`        | A combined Raft log and storage engine. Can be implemented by a single entity or split | `splitStorage(wal,engine)`, `pebble`                                |
+| `transport`      | An interconnect between Raft peers to facilitate message passing                       | `grpc`                                                              |
+| `pipeline`       | A Raft proposal pipeline loop which handles `raft.Ready` objects                       | `basic`, `parallelAppender`, `asyncStorage(earlyAck, lazyFollower)` |
 
 The components are configured in `newPeer`. In the future they will all be hooked up to flags.
 

@@ -3,7 +3,6 @@ package storage
 import (
 	"github.com/nvanbenschoten/rafttoy/storage/engine"
 	"github.com/nvanbenschoten/rafttoy/storage/wal"
-	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Storage combines the responsibilities of a Raft log and a storage engine.
@@ -12,13 +11,6 @@ import (
 type Storage interface {
 	wal.Wal
 	engine.Engine
-}
-
-// AtomicStorage is a Storage that supports atomically writing
-// Raft log entries and the Raft HardState.
-type AtomicStorage interface {
-	Storage
-	AppendAndSetHardState([]raftpb.Entry, raftpb.HardState, bool)
 }
 
 type splitStorage struct {
